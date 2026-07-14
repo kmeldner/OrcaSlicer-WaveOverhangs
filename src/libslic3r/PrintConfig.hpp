@@ -87,6 +87,22 @@ enum class WaveOverhangPattern : int {
     Smart
 };
 
+// Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6).
+enum class ThermalDwellScope : int {
+    WaveOverhangOnly,   // active only inside ;WAVE_OVERHANG regions (v1 default)
+    WholePrint          // active for the whole print (enabled later)
+};
+enum class ThermalDwellReset : int {
+    OnTravel,           // reset on any travel move
+    OnFastSegment,      // reset after a fast-flow segment (v1 default)
+    OnVolume            // reset once fast-extruded volume >= melt_zone_volume (most physical)
+};
+enum class ThermalDwellSchedule : int {
+    ForcedOnly,         // flush exactly at the limit
+    PreferLayerChange,  // snap to next layer change within lookahead
+    PreferAnyTravel     // snap to next layer change OR mid-layer travel (v1 default)
+};
+
 enum AuthorizationType {
     atKeyPassword, atUserPassword
 };
@@ -544,6 +560,9 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WaveOverhangSpacingMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WaveOverhangSeamMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WaveOverhangPattern)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ThermalDwellScope)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ThermalDwellReset)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ThermalDwellSchedule)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1175,6 +1194,21 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                     wave_overhang_corner_angle_threshold))
     ((ConfigOptionFloat,                     wave_overhang_end_retract_length))
     ((ConfigOptionBool,                      support_remaining_areas_after_wave_overhangs))
+    // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6). Inert while
+    // thermal_dwell_guard_enable is false; runtime behaviour lands in later stages.
+    ((ConfigOptionBool,                        thermal_dwell_guard_enable))
+    ((ConfigOptionEnum<ThermalDwellScope>,     thermal_dwell_scope))
+    ((ConfigOptionFloat,                       thermal_dwell_flow_threshold))
+    ((ConfigOptionFloat,                       thermal_dwell_max_time))
+    ((ConfigOptionFloat,                       thermal_dwell_fast_flow_threshold))
+    ((ConfigOptionEnum<ThermalDwellReset>,     thermal_dwell_reset_mode))
+    ((ConfigOptionFloat,                       thermal_dwell_melt_zone_volume))
+    ((ConfigOptionFloat,                       thermal_dwell_flush_z_lift))
+    ((ConfigOptionFloat,                       thermal_dwell_purge_volume))
+    ((ConfigOptionFloat,                       thermal_dwell_purge_flow))
+    ((ConfigOptionBool,                        thermal_dwell_wipe))
+    ((ConfigOptionEnum<ThermalDwellSchedule>,  thermal_dwell_schedule_mode))
+    ((ConfigOptionFloat,                       thermal_dwell_lookahead))
     ((ConfigOptionInt, wall_filament))
     ((ConfigOptionFloatOrPercent, inner_wall_line_width))
     ((ConfigOptionFloat, inner_wall_speed))

@@ -193,6 +193,27 @@ static t_config_enum_values s_keys_map_WaveOverhangPattern {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WaveOverhangPattern)
 
+// Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6).
+static t_config_enum_values s_keys_map_ThermalDwellScope {
+    { "wave_overhang_only", int(ThermalDwellScope::WaveOverhangOnly) },
+    { "whole_print",        int(ThermalDwellScope::WholePrint) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ThermalDwellScope)
+
+static t_config_enum_values s_keys_map_ThermalDwellReset {
+    { "on_travel",       int(ThermalDwellReset::OnTravel) },
+    { "on_fast_segment", int(ThermalDwellReset::OnFastSegment) },
+    { "on_volume",       int(ThermalDwellReset::OnVolume) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ThermalDwellReset)
+
+static t_config_enum_values s_keys_map_ThermalDwellSchedule {
+    { "forced_only",         int(ThermalDwellSchedule::ForcedOnly) },
+    { "prefer_layer_change", int(ThermalDwellSchedule::PreferLayerChange) },
+    { "prefer_any_travel",   int(ThermalDwellSchedule::PreferAnyTravel) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ThermalDwellSchedule)
+
 static t_config_enum_values s_keys_map_FuzzySkinType {
     { "none",           int(FuzzySkinType::None) },
     { "external",       int(FuzzySkinType::External) },
@@ -5119,6 +5140,151 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
                      "(treats every overhang as if waves weren't there).");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
+
+    // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6). All options are inert while
+    // thermal_dwell_guard_enable is false; runtime behaviour is added in later stages.
+    def = this->add("thermal_dwell_guard_enable", coBool);
+    def->label = L("Enable thermal dwell guard");
+    def->category = L("Strength");
+    def->tooltip = L("Insert periodic filament flushes during very-slow extrusion "
+                     "to prevent heat-creep jams. Off = stock behaviour.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("thermal_dwell_scope", coEnum);
+    def->label = L("Scope");
+    def->category = L("Strength");
+    def->tooltip = L("Where the guard is active. v1 scopes via the wave-overhang markers; "
+                     "whole-print scope is enabled later.");
+    def->enum_keys_map = &ConfigOptionEnum<ThermalDwellScope>::get_enum_values();
+    def->enum_values.push_back("wave_overhang_only");
+    def->enum_values.push_back("whole_print");
+    def->enum_labels.push_back(L("Wave overhang only"));
+    def->enum_labels.push_back(L("Whole print"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<ThermalDwellScope>(ThermalDwellScope::WaveOverhangOnly));
+
+    // TODO: candidate for per-filament coFloats
+    def = this->add("thermal_dwell_flow_threshold", coFloat);
+    def->label = L("Slow-flow threshold");
+    def->category = L("Strength");
+    def->tooltip = L("At or below this volumetric flow, extrusion is counted as slow and "
+                     "slow-flow seconds accumulate.");
+    def->sidetext = L("mm³/s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(2.0));
+
+    // TODO: candidate for per-filament coFloats
+    def = this->add("thermal_dwell_max_time", coFloat);
+    def->label = L("Max slow-flow time");
+    def->category = L("Strength");
+    def->tooltip = L("Safe accumulated slow-flow time before a flush is forced. "
+                     "Calibration placeholder — a (flow → safe-seconds) table replaces it later.");
+    def->sidetext = L("s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(120));
+
+    // TODO: candidate for per-filament coFloats
+    def = this->add("thermal_dwell_fast_flow_threshold", coFloat);
+    def->label = L("Fast-flow threshold");
+    def->category = L("Strength");
+    def->tooltip = L("At or above this volumetric flow, extrusion counts as fast and drives the "
+                     "accumulator reset. Must be ≥ the slow-flow threshold.");
+    def->sidetext = L("mm³/s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5.0));
+
+    def = this->add("thermal_dwell_reset_mode", coEnum);
+    def->label = L("Accumulator reset");
+    def->category = L("Strength");
+    def->tooltip = L("How the slow-flow accumulator resets: on any travel move, after a fast-flow "
+                     "segment, or once fast-extruded volume reaches the melt-zone volume.");
+    def->enum_keys_map = &ConfigOptionEnum<ThermalDwellReset>::get_enum_values();
+    def->enum_values.push_back("on_travel");
+    def->enum_values.push_back("on_fast_segment");
+    def->enum_values.push_back("on_volume");
+    def->enum_labels.push_back(L("On travel"));
+    def->enum_labels.push_back(L("On fast segment"));
+    def->enum_labels.push_back(L("On volume"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<ThermalDwellReset>(ThermalDwellReset::OnFastSegment));
+
+    // TODO: candidate for per-filament coFloats
+    def = this->add("thermal_dwell_melt_zone_volume", coFloat);
+    def->label = L("Melt-zone volume");
+    def->category = L("Strength");
+    def->tooltip = L("Effective molten volume in the hotend. Used by the on-volume reset and by "
+                     "later calibration.");
+    def->sidetext = L("mm³");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(15));
+
+    def = this->add("thermal_dwell_flush_z_lift", coFloat);
+    def->label = L("Flush Z-lift");
+    def->category = L("Strength");
+    def->tooltip = L("Z-hop applied before/along the travel to the flush position and during the "
+                     "purge, so the nozzle clears the part.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("thermal_dwell_purge_volume", coFloat);
+    def->label = L("Purge volume");
+    def->category = L("Strength");
+    def->tooltip = L("Filament ejected to clear over-soaked material. Roughly 1.5–2× the "
+                     "melt-zone volume.");
+    def->sidetext = L("mm³");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(25));
+
+    def = this->add("thermal_dwell_purge_flow", coFloat);
+    def->label = L("Purge flow");
+    def->category = L("Strength");
+    def->tooltip = L("Purge flow rate — deliberately fast, to force the hot-filament exchange.");
+    def->sidetext = L("mm³/s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(12));
+
+    def = this->add("thermal_dwell_wipe", coBool);
+    def->label = L("Wipe after purge");
+    def->category = L("Strength");
+    def->tooltip = L("Wipe the nozzle after purging, before returning. The wipe sequence is reused "
+                     "from the selected printer's filament-change G-code.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("thermal_dwell_schedule_mode", coEnum);
+    def->label = L("Flush scheduling");
+    def->category = L("Strength");
+    def->tooltip = L("Alignment strategy for placing a flush: exactly at the limit, snapped to the "
+                     "next layer change, or to the next layer change or mid-layer travel. Live from "
+                     "the scheduling stage; earlier stages behave as forced-only regardless.");
+    def->enum_keys_map = &ConfigOptionEnum<ThermalDwellSchedule>::get_enum_values();
+    def->enum_values.push_back("forced_only");
+    def->enum_values.push_back("prefer_layer_change");
+    def->enum_values.push_back("prefer_any_travel");
+    def->enum_labels.push_back(L("Forced only"));
+    def->enum_labels.push_back(L("Prefer layer change"));
+    def->enum_labels.push_back(L("Prefer any travel"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<ThermalDwellSchedule>(ThermalDwellSchedule::PreferAnyTravel));
+
+    def = this->add("thermal_dwell_lookahead", coFloat);
+    def->label = L("Scheduling look-ahead");
+    def->category = L("Strength");
+    def->tooltip = L("Maximum time a flush may be pulled early to hit a layer change or existing "
+                     "travel move.");
+    def->sidetext = L("s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(15));
 
     def = this->add("wall_filament", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;

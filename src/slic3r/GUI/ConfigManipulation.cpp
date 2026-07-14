@@ -1024,6 +1024,26 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         std::string("wave_overhang_floor_aux_fan_speed"),
     })
         toggle_line(k, wo_floor_hilbert);
+
+    // Thermal dwell guard: master toggle reveals the tunables, same master-toggle +
+    // reveal-sub-options shape as the wave-overhang sections above.
+    // (docs/thermal_dwell_guard/SPEC.md §6)
+    const bool td_enabled = config->opt_bool("thermal_dwell_guard_enable");
+    for (const std::string &k : {
+        std::string("thermal_dwell_scope"),
+        std::string("thermal_dwell_flow_threshold"),
+        std::string("thermal_dwell_max_time"),
+        std::string("thermal_dwell_fast_flow_threshold"),
+        std::string("thermal_dwell_reset_mode"),
+        std::string("thermal_dwell_melt_zone_volume"),
+        std::string("thermal_dwell_flush_z_lift"),
+        std::string("thermal_dwell_purge_volume"),
+        std::string("thermal_dwell_purge_flow"),
+        std::string("thermal_dwell_wipe"),
+        std::string("thermal_dwell_schedule_mode"),
+        std::string("thermal_dwell_lookahead"),
+    })
+        toggle_line(k, td_enabled);
 }
 
 void ConfigManipulation::update_print_sla_config(DynamicPrintConfig* config, const bool is_global_config/* = false*/)

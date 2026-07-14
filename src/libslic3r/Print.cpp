@@ -1597,6 +1597,15 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
         }
     }
 
+    // Thermal dwell guard: the fast-flow threshold must be >= the slow-flow threshold, otherwise
+    // the accumulator's reset condition can never be met. (docs/thermal_dwell_guard/SPEC.md §6)
+    for (PrintObject *object : m_objects)
+        for (const PrintRegion &region : object->all_regions())
+            if (region.config().thermal_dwell_guard_enable.value &&
+                region.config().thermal_dwell_fast_flow_threshold.value < region.config().thermal_dwell_flow_threshold.value)
+                return { L("Thermal dwell guard: the fast-flow threshold must be greater than or equal to the slow-flow threshold."),
+                         object, "thermal_dwell_fast_flow_threshold" };
+
     // Orca: G92 E0 is not supported when using absolute extruder addressing
     // This check is copied from PrusaSlicer, the original author is Vojtech Bubnik
     if(!is_BBL_printer()) {

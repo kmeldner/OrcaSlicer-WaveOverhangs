@@ -3320,6 +3320,16 @@ void MainFrame::init_menubar_as_editor()
         }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
+    // Thermal dwell guard (placeholder — the calibration wizard lands in a later stage)
+    append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Thermal dwell guard"), _L("Thermal dwell guard calibration"),
+        [this](wxCommandEvent&) {
+            MessageDialog dlg(this,
+                _L("Thermal dwell guard calibration is not implemented yet — coming in a later update."),
+                _L("Thermal dwell guard"), wxOK | wxICON_INFORMATION);
+            dlg.ShowModal();
+        }, "", nullptr,
+        [this]() {return m_plater->is_view3D_shown(); }, this);
+
     // help
     append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Calibration Guide"), _L("Calibration Guide"), [this](wxCommandEvent &)
                      { wxLaunchDefaultBrowser("https://www.orcaslicer.com/wiki/calibration_guide", wxBROWSER_NEW_WINDOW); }, "", nullptr, [this]()
@@ -3430,6 +3440,16 @@ void MainFrame::init_menubar_as_editor()
             m_vfa_test_dlg->ShowModal();
         }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
+
+    // Thermal dwell guard (placeholder — the calibration wizard lands in a later stage)
+    append_menu_item(calib_menu, wxID_ANY, _L("Thermal dwell guard"), _L("Thermal dwell guard calibration"),
+        [this](wxCommandEvent&) {
+            MessageDialog dlg(this,
+                _L("Thermal dwell guard calibration is not implemented yet — coming in a later update."),
+                _L("Thermal dwell guard"), wxOK | wxICON_INFORMATION);
+            dlg.ShowModal();
+        }, "", nullptr,
+        [this]() {return m_plater->is_view3D_shown(); }, this);
     // help
     append_menu_item(calib_menu, wxID_ANY, _L("Calibration Guide"), _L("Calibration Guide"),
         [this](wxCommandEvent&) { wxLaunchDefaultBrowser("https://www.orcaslicer.com/wiki/calibration_guide", wxBROWSER_NEW_WINDOW); }, "", nullptr,

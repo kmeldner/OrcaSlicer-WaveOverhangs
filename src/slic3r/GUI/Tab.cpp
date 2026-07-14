@@ -2487,6 +2487,23 @@ void TabPrint::build()
         optgroup->append_single_option_line("wave_overhang_floor_fan_speed");
         optgroup->append_single_option_line("wave_overhang_floor_aux_fan_speed");
 
+        // Thermal dwell guard: pre-inject filament flushes during very-slow extrusion to
+        // prevent heat-creep jams. Scoped to wave-overhang regions in v1, so it lives here.
+        optgroup = page->new_optgroup(L("Thermal dwell guard"), L"param_overhang");
+        optgroup->append_single_option_line("thermal_dwell_guard_enable");
+        optgroup->append_single_option_line("thermal_dwell_scope");
+        optgroup->append_single_option_line("thermal_dwell_flow_threshold");
+        optgroup->append_single_option_line("thermal_dwell_max_time");
+        optgroup->append_single_option_line("thermal_dwell_fast_flow_threshold");
+        optgroup->append_single_option_line("thermal_dwell_reset_mode");
+        optgroup->append_single_option_line("thermal_dwell_melt_zone_volume");
+        optgroup->append_single_option_line("thermal_dwell_flush_z_lift");
+        optgroup->append_single_option_line("thermal_dwell_purge_volume");
+        optgroup->append_single_option_line("thermal_dwell_purge_flow");
+        optgroup->append_single_option_line("thermal_dwell_wipe");
+        optgroup->append_single_option_line("thermal_dwell_schedule_mode");
+        optgroup->append_single_option_line("thermal_dwell_lookahead");
+
         optgroup = page->new_optgroup(L("Debug"), L"param_overhang");
         optgroup->append_single_option_line("wave_overhang_debug_gcode");
 

@@ -894,6 +894,14 @@ static std::vector<std::string> s_Preset_print_options {
     "wave_overhangs", "wave_overhangs_instead_of_bridges", "wave_overhang_outer_perimeters",
     "wave_overhang_perimeter_overlap", "wave_overhang_minimum_width", "wave_overhang_pattern",
     "support_remaining_areas_after_wave_overhangs",
+    // Thermal dwell guard (docs/thermal_dwell_guard/SPEC.md §7). Keys must be listed here or they
+    // are absent from the Print preset and the settings tab crashes when rendering them.
+    "thermal_dwell_guard_enable", "thermal_dwell_scope",
+    "thermal_dwell_flow_threshold", "thermal_dwell_max_time", "thermal_dwell_fast_flow_threshold",
+    "thermal_dwell_reset_mode", "thermal_dwell_melt_zone_volume",
+    "thermal_dwell_flush_z_lift", "thermal_dwell_purge_volume", "thermal_dwell_purge_flow",
+    "thermal_dwell_wipe",
+    "thermal_dwell_schedule_mode", "thermal_dwell_lookahead",
     "wave_overhang_line_spacing", "wave_overhang_flow_mm3_per_mm",
     "wave_overhang_print_speed", "wave_overhang_perimeter_speed", "wave_overhang_travel_speed", "wave_overhang_fan_speed",
     "wave_overhang_aux_fan_speed",
