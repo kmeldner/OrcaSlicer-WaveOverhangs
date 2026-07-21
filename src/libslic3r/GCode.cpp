@@ -10,6 +10,7 @@
 #include "EdgeGrid.hpp"
 #include "Geometry/ConvexHull.hpp"
 #include "GCode/PrintExtents.hpp"
+#include "GCode/ThermalDwellGuard.hpp"
 #include "GCode/Thumbnails.hpp"
 #include "GCode/WipeTower.hpp"
 #include "ShortestPath.hpp"
@@ -2517,7 +2518,15 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     std::string thumbnails_value = print.config().option<ConfigOptionString>("thumbnails")->value;
     // search string for the BTT_TFT label
     bool has_BTT_thumbnail = (thumbnails_value.find("BTT_TFT") != std::string::npos);
-    
+
+    // Orca: thermal dwell guard config echo (STAGE1 §5). Deliberately outside the HEADER_BLOCK
+    // gate below — that block is skipped entirely for BTT_TFT thumbnails, and the guard's
+    // presence must not depend on a thumbnail setting. resolve_config() is the same call that
+    // decides whether GCodeProcessor builds a guard at all, so this line always describes what
+    // actually ran. Emitted only when the guard is on, so guard-off output is untouched.
+    if (const std::optional<ThermalDwell::Config> td_cfg = ThermalDwellGuard::resolve_config(print))
+        file.write(ThermalDwellGuard::format_config_comment(*td_cfg));
+
     if(!has_BTT_thumbnail){
         file.write_format("; HEADER_BLOCK_START\n");
         // Write information on the generator.
@@ -6362,7 +6371,16 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         gcode += wave_temp_restore_gcode();
 
     // Orca: wave-overhang debug-gcode markers (per-path scope).
-    const bool emit_wave_overhang_markers = path.wave_overhang && m_config.wave_overhang_debug_gcode.value;
+    // The thermal dwell guard consumes these same START/END markers as its scope signal when
+    // thermal_dwell_scope = WaveOverhangOnly, so they must be emitted for the guard even when
+    // the debug toggle is off: they stop being debug output the moment something reads them,
+    // and gating a functional input on a debug switch would make the guard silently no-op on a
+    // setting unrelated to it. With the guard off this reduces to the original condition, so
+    // guard-off output stays byte-identical to stock by construction.
+    const bool wave_markers_for_guard = m_config.thermal_dwell_guard_enable.value &&
+                                        m_config.thermal_dwell_scope.value == ThermalDwellScope::WaveOverhangOnly;
+    const bool emit_wave_overhang_markers = path.wave_overhang &&
+                                            (m_config.wave_overhang_debug_gcode.value || wave_markers_for_guard);
     if (emit_wave_overhang_markers)
         gcode += "; WAVE_OVERHANG_START\n";
 

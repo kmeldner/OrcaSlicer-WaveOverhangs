@@ -6,10 +6,12 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/CustomGCode.hpp"
+#include "libslic3r/GCode/ThermalDwellGuard.hpp"
 
 #include <cstdint>
 #include <array>
 #include <vector>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -329,6 +331,11 @@ class Print;
         static const std::string VFlush_Start_Tag;
         static const std::string VFlush_End_Tag;
         static const std::string External_Purge_Tag;
+        // Orca: wave-overhang region markers, consumed as the thermal dwell guard's scope
+        // signal. Plain statics rather than entries in Reserved_Tags, which is index-coupled
+        // to ETags and would also make these rejected inside user custom G-code.
+        static const std::string Wave_Overhang_Start_Tag;
+        static const std::string Wave_Overhang_End_Tag;
     public:
         enum class ETags : unsigned char
         {
@@ -445,6 +452,14 @@ class Print;
             float acceleration{ 0.0f }; // mm/s^2
             float max_entry_speed{ 0.0f }; // mm/s
             float safe_feedrate{ 0.0f }; // mm/s
+            // Orca: thermal dwell guard (Stage 1). Stamped when the block is created, because
+            // by the time TimeMachine::calculate_time() resolves this block's trapezoid the
+            // live parser state has moved on by up to Planner::refresh_threshold blocks.
+            // Reading them off m_result.moves[move_id] instead is not an option: move_id is
+            // remapped by actual-speed-move insertion and process_VG1 never sets it.
+            float thermal_dwell_volume{ 0.0f }; // mm^3 filament; 0 unless move_type == Extrude
+            float thermal_dwell_z{ 0.0f };      // mm, nozzle Z at the end of the move
+            bool  thermal_dwell_in_wave{ false };
             Flags flags;
             FeedrateProfile feedrate_profile;
             Trapezoid trapezoid;
@@ -544,7 +559,10 @@ class Print;
 
             void reset();
 
-            void calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks = 0, float additional_time = 0.0f);
+            // Orca: `guard` is the thermal dwell guard, or nullptr when it is disabled. This is
+            // the only point where a block's final accel-aware duration and its parse-time
+            // stamps are both in scope, so it is where the guard is fed.
+            void calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks = 0, float additional_time = 0.0f, ThermalDwellGuard* guard = nullptr);
         };
 
         struct UsedFilaments  // filaments per ColorChange
@@ -802,6 +820,12 @@ class Print;
         bool m_processing_start_custom_gcode;
         unsigned int m_g1_line_id;
         unsigned int m_layer_id;
+        // Orca: thermal dwell guard scope. A level, not a latch: the wave-overhang markers are
+        // emitted per ExtrusionPath, so START/END pairs repeat across one visual region.
+        bool m_in_wave_overhang{ false };
+        // Orca: thermal dwell guard (Stage 1). Null unless a print region enables the guard,
+        // which is the single master gate that keeps guard-off output byte-identical to stock.
+        std::unique_ptr<ThermalDwellGuard> m_thermal_dwell_guard;
         CpColor m_cp_color;
         SeamsDetector m_seams_detector;
         OptionsZCorrector m_options_z_corrector;
@@ -852,7 +876,10 @@ class Print;
                                               const std::vector<int>      &filament_map,
                                               const std::vector<std::set<int>>& unprintable_filament_types );
         void apply_config(const PrintConfig& config);
-        void set_print(Print* print) { m_print = print; }
+        // Orca: also builds the thermal dwell guard when a print region enables it, which is
+        // why this is no longer a trivial setter. Called before the first G-code byte is
+        // written, so the guard sees the whole stream.
+        void set_print(Print* print);
 
         DynamicConfig export_config_for_render() const;
 

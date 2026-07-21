@@ -89,7 +89,7 @@ enum class WaveOverhangPattern : int {
 
 // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6).
 enum class ThermalDwellScope : int {
-    WaveOverhangOnly,   // active only inside ;WAVE_OVERHANG regions (v1 default)
+    WaveOverhangOnly,   // active only inside "; WAVE_OVERHANG_START/END" regions (v1 default)
     WholePrint          // active for the whole print (enabled later)
 };
 enum class ThermalDwellReset : int {

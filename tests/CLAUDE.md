@@ -98,9 +98,16 @@ REQUIRE_THAT(calculated_value, WithinULP(expected, 4));     // 4 ULPs apart
 
 ## Overview of OrcaSlicer's Testing Framework
 
-OrcaSlicer uses **Catch2 v2** as its primary testing framework. The test suite is organized into several modules that mirror the project's architectural components:
+OrcaSlicer uses **Catch2 v3** as its primary testing framework. The test suite is organized into several modules that mirror the project's architectural components:
 
-> **Note**: OrcaSlicer currently uses Catch2 v2 (based on `#include <catch2/catch.hpp>` includes). Some features mentioned in this guide are only available in v3 and marked accordingly.
+> **Note**: This fork vendors **Catch2 v3.11.0** at `tests/catch2` (see its `CMakeLists.txt`).
+> Test files include `<catch2/catch_all.hpp>` and link `Catch2::Catch2WithMain`. Earlier revisions
+> of this guide claimed v2 with `<catch2/catch.hpp>`; that is wrong — trust the vendored tree.
+> v3-only features (`SKIP()`, `ContainsSubstring`, `STATIC_CHECK`, built-in benchmarking) ARE
+> available, despite notes to the contrary further down this document.
+>
+> Tests are gated behind the `BUILD_TESTS` CMake option, which is **OFF** by default. Configure
+> with `-DBUILD_TESTS=ON` before building any test target.
 
 ### Test Structure
 ```
@@ -149,13 +156,13 @@ Stereolithography specific tests:
 
 ### File Organization
 1. **Naming Convention**: `test_<feature>.cpp` (e.g., `test_geometry.cpp`)
-2. **Header Structure**: Include `<catch2/catch.hpp>` first, then relevant headers
+2. **Header Structure**: Include `<catch2/catch_all.hpp>` first, then relevant headers
 3. **Namespace Usage**: Use `using namespace Slic3r;` for convenience
 4. **File Placement**: Add to appropriate test directory and update CMakeLists.txt
 
 ### Test Naming and Structure
 ```cpp
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include "libslic3r/Point.hpp"
 
 using namespace Slic3r;

@@ -243,6 +243,10 @@ set(lisbslic3r_sources
     GCode/SmallAreaInfillFlowCompensator.hpp
     GCode/SpiralVase.cpp
     GCode/SpiralVase.hpp
+    GCode/ThermalDwellAccumulator.cpp
+    GCode/ThermalDwellAccumulator.hpp
+    GCode/ThermalDwellGuard.cpp
+    GCode/ThermalDwellGuard.hpp
     GCode/ThumbnailData.cpp
     GCode/ThumbnailData.hpp
     GCode/Thumbnails.cpp

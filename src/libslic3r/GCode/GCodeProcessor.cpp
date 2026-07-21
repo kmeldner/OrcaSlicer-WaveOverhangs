@@ -110,6 +110,14 @@ const std::string GCodeProcessor::VFlush_End_Tag  = " VFLUSH_END";
 //Orca: External device purge tag
 const std::string GCodeProcessor::External_Purge_Tag = " EXTERNAL_PURGE";
 
+// Orca: wave-overhang region markers, emitted by GCode::_extrude(). The leading space is
+// required — the emitted line is "; WAVE_OVERHANG_START" and process_gcode_line() strips only
+// the ';'. Matched in full because "; WAVE_OVERHANG_BUILD" and "; WAVE_OVERHANG_CONFIG" share
+// the prefix. (The ";_WAVE_OVERHANG_FAN_*" family is a different convention entirely — no
+// space, leading underscore — and is consumed and stripped by CoolingBuffer.)
+const std::string GCodeProcessor::Wave_Overhang_Start_Tag = " WAVE_OVERHANG_START";
+const std::string GCodeProcessor::Wave_Overhang_End_Tag = " WAVE_OVERHANG_END";
+
 const float GCodeProcessor::Wipe_Width = 0.05f;
 const float GCodeProcessor::Wipe_Height = 0.05f;
 
@@ -395,7 +403,7 @@ static void recalculate_trapezoids(std::vector<GCodeProcessor::TimeBlock>& block
     }
 }
 
-void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks, float additional_time)
+void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks, float additional_time, ThermalDwellGuard* guard)
 {
     if (!enabled || blocks.size() < 2)
         return;
@@ -417,13 +425,30 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
     const size_t n_blocks_process = blocks.size() - keep_last_n_blocks;
     for (size_t i = 0; i < n_blocks_process; ++i) {
         const TimeBlock& block = blocks[i];
-        float block_time = block.time();
+        const float move_time = block.time();
+        float block_time = move_time;
         if (i == 0)
             block_time += additional_time;
 
         time += double(block_time);
         result.moves[block.move_id].time[static_cast<size_t>(mode)] = block_time;
         gcode_time.cache += block_time;
+
+        // Orca: thermal dwell guard (Stage 1, detection only). The only point where a block's
+        // final accel-aware duration and its parse-time stamps are both in scope. Three
+        // constraints here are load-bearing:
+        //  - This must stay ABOVE the `if (mode == Normal)` block below, whose type filter
+        //    `continue`s the loop for anything that is not Extrude/Travel/Wipe — i.e. exactly
+        //    the Retract/Unretract moves the accumulator needs for its non-extruding rows.
+        //  - Normal mode only; Stealth would feed every move a second time.
+        //  - move_time, NOT block_time: block_time folds simulate_st_synchronize()'s
+        //    additional_time into block 0, which would corrupt the flow q = volume/duration
+        //    and mis-file a fast move as slow. That dwell is fed separately below.
+        if (guard != nullptr && mode == PrintEstimatedStatistics::ETimeMode::Normal)
+            guard->on_move(block.move_type == EMoveType::Extrude, move_time,
+                           block.thermal_dwell_volume, block.thermal_dwell_in_wave,
+                           block.g1_line_id, block.layer_id, block.thermal_dwell_z);
+
         //BBS
         if (block.flags.prepare_stage)
             prepare_time += block_time;
@@ -530,6 +555,21 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
             [](const StopTime& t, unsigned int value) { return t.g1_line_id < value; });
         if (it_stop_time != stop_times.end() && it_stop_time->g1_line_id == block.g1_line_id)
             it_stop_time->elapsed_time = float(time);
+    }
+
+    // Orca: thermal dwell guard — additional_time is a firmware-synchronize dwell (G4, M400,
+    // tool change...). The loop above folds it into block 0's reported time for total-time
+    // accounting, but physically it happens after every block flushed here, and it is
+    // non-extruding time during which the filament sits static in the hot zone. So feed it as
+    // its own synthetic non-extruding move rather than letting it distort a real move's flow.
+    // It is only ever non-zero when keep_last_n_blocks == 0, so "after the loop" really is
+    // "after all pending blocks". This matters in practice: wave_overhang_min_wave_time emits
+    // a G4 after every wave path.
+    if (guard != nullptr && mode == PrintEstimatedStatistics::ETimeMode::Normal &&
+        additional_time > 0.0f && n_blocks_process > 0) {
+        const TimeBlock& last = blocks[n_blocks_process - 1];
+        guard->on_move(false, additional_time, 0.0f, last.thermal_dwell_in_wave,
+                       last.g1_line_id, last.layer_id, last.thermal_dwell_z);
     }
 
     if (keep_last_n_blocks) {
@@ -1160,6 +1200,31 @@ void GCodeProcessor::run_post_process()
     for (const auto& machine : m_time_processor.machines)
         g1_times_cache_it.emplace_back(machine.g1_times_cache.begin());
 
+    // Orca: thermal dwell guard — cursor into the recorded flush anchors, advanced in lockstep
+    // with the same g1_lines_counter merge-join the M73 emitter uses.
+    std::vector<ThermalDwellGuard::FlushAnchor>::const_iterator td_anchor_it;
+    std::vector<ThermalDwellGuard::FlushAnchor>::const_iterator td_anchor_end;
+    if (m_thermal_dwell_guard != nullptr) {
+        td_anchor_it = m_thermal_dwell_guard->anchors().begin();
+        td_anchor_end = m_thermal_dwell_guard->anchors().end();
+    }
+
+    // Orca: thermal dwell guard — emit ";THERMAL_DWELL_FLUSH_POINT" after the move that
+    // crossed the limit. Takes the id of the LAST block belonging to the line just appended
+    // and drains every anchor at or below it, so nothing is dropped: G2/G3 collapse several
+    // blocks onto a single line, and G10/G11 re-use the preceding line's id.
+    auto process_line_thermal_dwell = [&td_anchor_it, &td_anchor_end, &export_line](const size_t last_block_id_on_line) {
+        while (td_anchor_it != td_anchor_end && td_anchor_it->g1_line_id <= last_block_id_on_line) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_POINT id=%u acc=%.2fs layer=%u z=%.3f\n",
+                     td_anchor_it->id, td_anchor_it->acc, td_anchor_it->layer, td_anchor_it->z);
+            // ignore_from_move = true, or this line steals the original->final line mapping
+            // slot and synchronize_moves() mis-maps MoveVertex::gcode_id.
+            export_line.append_line(buf, true);
+            ++td_anchor_it;
+        }
+    };
+
     // add lines M73 to exported gcode
     auto process_line_move = [
         // Lambdas, mostly for string formatting, all with an empty capture block.
@@ -1364,6 +1429,8 @@ void GCodeProcessor::run_post_process()
                             export_line.append_line(gcode_line);
                             // add lines M73 where needed
                             process_line_move(g1_lines_counter++);
+                            // Orca: post-increment value == this line's own block id
+                            process_line_thermal_dwell(g1_lines_counter);
                             gcode_line.clear();
                         }
                         else if (GCodeReader::GCodeLine::cmd_is(gcode_line, "G2") || GCodeReader::GCodeLine::cmd_is(gcode_line, "G3")) {
@@ -1371,10 +1438,16 @@ void GCodeProcessor::run_post_process()
                             // add lines M73 where needed
                             process_line_move(g1_lines_counter + internal_g1_lines_counter);
                             g1_lines_counter += (1 + internal_g1_lines_counter);
+                            // Orca: the arc's last sub-segment id
+                            process_line_thermal_dwell(g1_lines_counter);
                             gcode_line.clear();
                         }
                         else if (GCodeReader::GCodeLine::cmd_is(gcode_line, "G28")) {
                             ++g1_lines_counter;
+                            // Orca: G28 consumes an id, so drain here too and keep the inline
+                            // marker count equal to the SUMMARY count. (A homing move should
+                            // never carry an anchor; this just removes the assumption.)
+                            process_line_thermal_dwell(g1_lines_counter);
                         }
                         else if (m_result.backtrace_enabled && GCodeReader::GCodeLine::cmd_starts_with(gcode_line, "T")) {
                             // add lines M104 where needed
@@ -1391,6 +1464,21 @@ void GCodeProcessor::run_post_process()
             }
             if (eof)
                 break;
+        }
+    }
+
+    // Orca: thermal dwell guard summary (STAGE1 §5). Must precede flush(): append_line() only
+    // pushes into ExportLines' write-behind cache, and flush() is what drains the remainder to
+    // the file. ignore_from_move = true for the same reason as the inline markers.
+    if (m_thermal_dwell_guard != nullptr) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), ";THERMAL_DWELL_SUMMARY count=%zu\n",
+                 m_thermal_dwell_guard->anchors().size());
+        export_line.append_line(buf, true);
+        for (const ThermalDwellGuard::FlushAnchor& anchor : m_thermal_dwell_guard->anchors()) {
+            snprintf(buf, sizeof(buf), ";THERMAL_DWELL_POINT id=%u layer=%u z=%.3f acc=%.2f\n",
+                     anchor.id, anchor.layer, anchor.z, anchor.acc);
+            export_line.append_line(buf, true);
         }
     }
 
@@ -1928,6 +2016,22 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
     return valid;
 }
 
+void GCodeProcessor::set_print(Print* print)
+{
+    m_print = print;
+
+    // Orca: thermal dwell guard (Stage 1). Built only when some print region enables it;
+    // otherwise the pointer stays null and every Stage 1 branch is dead, which is what makes
+    // guard-off output byte-identical to stock by construction rather than by testing.
+    // resolve_config() is shared with GCode.cpp's ;THERMAL_DWELL_CONFIG echo, so the echo and
+    // the behaviour can never disagree.
+    m_thermal_dwell_guard.reset();
+    if (print != nullptr) {
+        if (const std::optional<ThermalDwell::Config> cfg = ThermalDwellGuard::resolve_config(*print))
+            m_thermal_dwell_guard = std::make_unique<ThermalDwellGuard>(*cfg);
+    }
+}
+
 void GCodeProcessor::apply_config(const PrintConfig& config)
 {
     m_parser.apply_config(config);
@@ -2452,6 +2556,9 @@ void GCodeProcessor::reset()
     m_processing_start_custom_gcode = false;
     m_g1_line_id = 0;
     m_layer_id = 0;
+    // Orca: thermal dwell guard scope. The guard itself is (re)built in set_print(), which
+    // always runs after construction, so it is deliberately not touched here.
+    m_in_wave_overhang = false;
     m_cp_color.reset();
 
     m_producer = EProducer::Unknown;
@@ -2601,6 +2708,14 @@ void GCodeProcessor::finalize(bool post_process)
     }
 
     calculate_time(m_result);
+
+    // Orca: thermal dwell guard (Stage 1) — one INFO line per slice. Placed after the final
+    // calculate_time(), which drains the last blocks the incremental passes held back, so the
+    // anchor list is complete here.
+    if (m_thermal_dwell_guard != nullptr)
+        BOOST_LOG_TRIVIAL(info) << "Thermal dwell guard: " << m_thermal_dwell_guard->anchors().size()
+                                << " flush point(s), " << m_thermal_dwell_guard->total_slow_flow_seconds()
+                                << " s total slow-flow time.";
 
     // process the time blocks
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
@@ -3067,6 +3182,20 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     if (boost::starts_with(comment, reserved_tag(ETags::Wipe_Tower_End))) {
         m_wipe_tower = false;
         m_used_filaments.process_wipe_tower_cache(this);
+        return;
+    }
+
+    // Orca: wave-overhang region scope for the thermal dwell guard. Emitted per
+    // ExtrusionPath, so these repeat many times across one visual overhang region — the flag
+    // is a level, not a latch. Matched before the shorter tags below so that neither
+    // "; WAVE_OVERHANG_BUILD" nor "; WAVE_OVERHANG_CONFIG" can be mistaken for a region edge.
+    if (boost::starts_with(comment, GCodeProcessor::Wave_Overhang_Start_Tag)) {
+        m_in_wave_overhang = true;
+        return;
+    }
+
+    if (boost::starts_with(comment, GCodeProcessor::Wave_Overhang_End_Tag)) {
+        m_in_wave_overhang = false;
         return;
     }
 
@@ -3796,11 +3925,17 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         return;
 
     EMoveType type = move_type(delta_pos);
+    // Orca: thermal dwell guard — extruded volume for this move, stamped onto the time block
+    // below. Stays 0 for non-extrude moves; note m_mm3_per_mm and m_travel_dist are only
+    // assigned in the Extrude branch and so go stale on travels, which is why this is a fresh
+    // local rather than a later recomputation from those members.
+    float thermal_dwell_move_volume = 0.0f;
     if (type == EMoveType::Extrude) {
         const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
         m_travel_dist = delta_xyz;
         float volume_extruded_filament = area_filament_cross_section * delta_pos[E];
         float area_toolpath_cross_section = volume_extruded_filament / delta_xyz;
+        thermal_dwell_move_volume = volume_extruded_filament;
 
         if(m_extrusion_role == ExtrusionRole::erSupportMaterial || m_extrusion_role == ExtrusionRole::erSupportMaterialInterface || m_extrusion_role ==ExtrusionRole::erSupportTransition)
             m_used_filaments.increase_support_caches(volume_extruded_filament);
@@ -3907,6 +4042,11 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         block.move_id = static_cast<unsigned int>(m_result.moves.size());
         block.remaining_internal_g1_lines = remaining_internal_g1_lines.has_value() ? *remaining_internal_g1_lines : 0;
         block.layer_id = std::max<unsigned int>(1, m_layer_id);
+        // Orca: thermal dwell guard — see the TimeBlock field comments for why these are
+        // stamped here instead of read back off m_result.moves when the block resolves.
+        block.thermal_dwell_volume = thermal_dwell_move_volume;
+        block.thermal_dwell_z = float(m_end_position[Z]);
+        block.thermal_dwell_in_wave = m_in_wave_overhang;
         block.flags.prepare_stage = m_processing_start_custom_gcode;
 
         //BBS: limite the cruise according to centripetal acceleration
@@ -4265,6 +4405,13 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
         block.distance = distance;
         block.g1_line_id = m_g1_line_id;
         block.layer_id = std::max<unsigned int>(1, m_layer_id);
+        // Orca: thermal dwell guard — stamped here as in process_G1. Note this path leaves
+        // block.move_id at 0; stamping the data onto the block rather than looking it up via
+        // m_result.moves[move_id] is what keeps the guard correct despite that.
+        block.thermal_dwell_volume = (type == EMoveType::Extrude)
+            ? float(area_filament_cross_section * delta_pos[E]) : 0.0f;
+        block.thermal_dwell_z = float(m_end_position[Z]);
+        block.thermal_dwell_in_wave = m_in_wave_overhang;
         block.flags.prepare_stage = m_processing_start_custom_gcode;
 
         //BBS: limite the cruise according to centripetal acceleration
@@ -5757,7 +5904,7 @@ void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_la
     std::vector<TimeMachine::ActualSpeedMove> actual_speed_moves;
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
         TimeMachine& machine = m_time_processor.machines[i];
-        machine.calculate_time(m_result, static_cast<PrintEstimatedStatistics::ETimeMode>(i), keep_last_n_blocks, additional_time);
+        machine.calculate_time(m_result, static_cast<PrintEstimatedStatistics::ETimeMode>(i), keep_last_n_blocks, additional_time, m_thermal_dwell_guard.get());
         if (static_cast<PrintEstimatedStatistics::ETimeMode>(i) == PrintEstimatedStatistics::ETimeMode::Normal)
             actual_speed_moves = std::move(machine.actual_speed_moves);
     }

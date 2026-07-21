@@ -5089,7 +5089,7 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def = this->add("wave_overhang_debug_gcode", coBool);
     def->label = L("Debug g-code");
     def->category = L("Strength");
-    def->tooltip = L("Emit ';WAVE_OVERHANG_START'/';WAVE_OVERHANG_END' comments around wave-overhang "
+    def->tooltip = L("Emit '; WAVE_OVERHANG_START'/'; WAVE_OVERHANG_END' comments around wave-overhang "
                      "extrusions in the G-code. Useful for post-process inspection and debugging. "
                      "Comments only, no effect on the print.");
     def->mode = comAdvanced;

@@ -59,7 +59,7 @@ this fork (names have likely drifted from upstream) and build on:
 | Travel head to a designated position / at layer change | timelapse feature (parks toolhead) |
 | Purge a set volume + wipe | filament-change / wipe-tower / prime-tower logic |
 | Splice sequences into the stream | layer-change and custom-G-code injection hooks |
-| Scope to slow regions | this fork's `;WAVE_OVERHANG_START` / `;WAVE_OVERHANG_END` markers |
+| Scope to slow regions | this fork's `; WAVE_OVERHANG_START` / `; WAVE_OVERHANG_END` markers |
 
 For the flush move, reuse existing `travel_speed`, retraction (`retract_length`,
 `retract_speed`, `deretract_speed`) and `z_hop` config rather than adding duplicates.
@@ -91,7 +91,14 @@ no toolpath changes.) Types are Slic3r `ConfigOption` kinds. `sidetext` = the Un
 | Key | Type | Default | Unit | Purpose |
 |---|---|---|---|---|
 | `thermal_dwell_guard_enable` | coBool | `false` | — | Master switch. Off = stock behaviour. |
-| `thermal_dwell_scope` | coEnum `ThermalDwellScope` | `WaveOverhangOnly` | — | Where active. v1 scopes via `;WAVE_OVERHANG` markers; `WholePrint` later. |
+| `thermal_dwell_scope` | coEnum `ThermalDwellScope` | `WaveOverhangOnly` | — | Where active. v1 scopes via `; WAVE_OVERHANG_START` / `; WAVE_OVERHANG_END` markers; `WholePrint` later. |
+
+**Marker coupling (Stage 1).** Those markers are emitted per *ExtrusionPath* by `GCode::_extrude`,
+and were originally gated on `wave_overhang_debug_gcode`. Since `WaveOverhangOnly` makes them a
+*functional input* rather than debug output, `_extrude` now also emits them whenever the guard is
+enabled with that scope. With the guard off the condition reduces to the original one, so
+guard-off output stays byte-identical. Consequence: `wave_overhang_debug_gcode = false` no longer
+guarantees a marker-free file when the guard is on.
 
 ### Group 2 — Trigger (thermal model)
 
@@ -205,9 +212,13 @@ Build and verify each stage before starting the next.
   stage). *Verify:* options appear in the UI; the calibration placeholder appears; with the guard
   disabled, the sliced toolpath is byte-identical to stock — the only diff vs stock is the inert
   `; thermal_dwell_* = <default>` lines added to the embedded `; CONFIG_BLOCK`.
-- **Stage 1 — Detect only.** Accumulate slow-flow time within `;WAVE_OVERHANG` regions and
-  emit a `;THERMAL_DWELL t=NN` comment where a flush *would* occur. No injection. *Verify:*
-  comments land at sane spots; times match a hand calculation.
+- **Stage 1 — Detect only.** Accumulate slow-flow time within `; WAVE_OVERHANG_START/END`
+  regions and mark where a flush *would* occur. No injection. **See
+  `docs/thermal_dwell_guard/STAGE1.md`, which governs this stage.** In particular the
+  `;THERMAL_DWELL t=NN` sketch above is superseded by STAGE1 §5's three-form grammar
+  (`;THERMAL_DWELL_CONFIG` echo, `;THERMAL_DWELL_FLUSH_POINT` lines, `;THERMAL_DWELL_SUMMARY`
+  block). *Verify:* STAGE1 §7's acceptance checklist — comments land at sane spots and survive an
+  independent recomputation by `scripts/check_thermal_dwell.py`.
 - **Stage 2 — Forced flush injection.** At threshold: retract → z-hop → travel to flush pos
   → purge at purge flow → optional wipe → return → resume, then reset accumulator. *Verify:*
   sequences correct in preview and raw G-code.
@@ -220,10 +231,17 @@ Build and verify each stage before starting the next.
 
 ## 9. Verification without printing
 
-The fork emits wave-overhang marker comments in the G-code (confirm exact names in source).
+The fork emits wave-overhang marker comments in the G-code. Confirmed in source
+(`GCode::_extrude`): they are **`; WAVE_OVERHANG_START`** and **`; WAVE_OVERHANG_END`** — note the
+space after the semicolon, which several older docs get wrong. A separate `;_WAVE_OVERHANG_FAN_*`
+family (leading underscore, no space) is consumed and stripped by `CoolingBuffer` and is not
+usable for scoping.
+
 To check any stage: slice a small overhang test model, then diff toolpath/G-code before vs
-after, and inspect the `;THERMAL_DWELL` / flush sequences. This closes the loop in seconds
+after, and inspect the `;THERMAL_DWELL_*` / flush sequences. This closes the loop in seconds
 rather than test prints. Only move to filament once G-code inspection passes.
+`scripts/gen_overhang_test_model.py` generates a suitable cantilever test model, and
+`scripts/check_thermal_dwell.py` verifies the Stage 1 markers independently.
 
 ## 10. Out of scope (v1)
 
