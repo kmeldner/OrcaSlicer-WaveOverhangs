@@ -331,11 +331,6 @@ class Print;
         static const std::string VFlush_Start_Tag;
         static const std::string VFlush_End_Tag;
         static const std::string External_Purge_Tag;
-        // Orca: wave-overhang region markers, consumed as the thermal dwell guard's scope
-        // signal. Plain statics rather than entries in Reserved_Tags, which is index-coupled
-        // to ETags and would also make these rejected inside user custom G-code.
-        static const std::string Wave_Overhang_Start_Tag;
-        static const std::string Wave_Overhang_End_Tag;
     public:
         enum class ETags : unsigned char
         {
@@ -452,14 +447,23 @@ class Print;
             float acceleration{ 0.0f }; // mm/s^2
             float max_entry_speed{ 0.0f }; // mm/s
             float safe_feedrate{ 0.0f }; // mm/s
-            // Orca: thermal dwell guard (Stage 1). Stamped when the block is created, because
-            // by the time TimeMachine::calculate_time() resolves this block's trapezoid the
-            // live parser state has moved on by up to Planner::refresh_threshold blocks.
-            // Reading them off m_result.moves[move_id] instead is not an option: move_id is
-            // remapped by actual-speed-move insertion and process_VG1 never sets it.
-            float thermal_dwell_volume{ 0.0f }; // mm^3 filament; 0 unless move_type == Extrude
-            float thermal_dwell_z{ 0.0f };      // mm, nozzle Z at the end of the move
-            bool  thermal_dwell_in_wave{ false };
+            // Orca: thermal dwell guard. Stamped when the block is created, because by the time
+            // TimeMachine::calculate_time() resolves this block's trapezoid the live parser
+            // state has moved on by up to Planner::refresh_threshold blocks. Reading them off
+            // m_result.moves[move_id] instead is not an option: move_id is remapped by
+            // actual-speed-move insertion and process_VG1 never sets it.
+            float thermal_dwell_volume{ 0.0f };   // mm^3 filament; 0 unless move_type == Extrude
+            float thermal_dwell_z{ 0.0f };        // mm, nozzle Z at the end of the move
+            // Stage 2 snapshot of the machine state the flush must restore (STAGE2 §4), plus the
+            // exclusion-zone flag that defers an anchor out of a toolchange/custom-gcode block.
+            bool  thermal_dwell_excluded{ false };
+            float thermal_dwell_x{ 0.0f };        // mm, nozzle X at end of move
+            float thermal_dwell_y{ 0.0f };        // mm, nozzle Y at end of move
+            float thermal_dwell_e{ 0.0f };        // logical E at end of move (filament mm)
+            bool  thermal_dwell_e_relative{ true };// M83 relative E (else M82 absolute)
+            bool  thermal_dwell_retracted{ false };// filament retracted after this move
+            float thermal_dwell_feedrate{ 0.0f };  // modal feedrate F [mm/min]
+            unsigned int thermal_dwell_tool{ 0 };  // active tool
             Flags flags;
             FeedrateProfile feedrate_profile;
             Trapezoid trapezoid;
@@ -820,11 +824,12 @@ class Print;
         bool m_processing_start_custom_gcode;
         unsigned int m_g1_line_id;
         unsigned int m_layer_id;
-        // Orca: thermal dwell guard scope. A level, not a latch: the wave-overhang markers are
-        // emitted per ExtrusionPath, so START/END pairs repeat across one visual region.
-        bool m_in_wave_overhang{ false };
-        // Orca: thermal dwell guard (Stage 1). Null unless a print region enables the guard,
-        // which is the single master gate that keeps guard-off output byte-identical to stock.
+        // Orca: thermal dwell guard (Stage 2). Running retract state, toggled by the existing
+        // Retract/Unretract move classification, so an anchor can restore the anchor's exact
+        // retract state. GCodeProcessor otherwise tracks no such flag.
+        bool m_retracted{ false };
+        // Null unless a print region enables the guard, which is the single master gate that
+        // keeps guard-off output byte-identical to stock.
         std::unique_ptr<ThermalDwellGuard> m_thermal_dwell_guard;
         CpColor m_cp_color;
         SeamsDetector m_seams_detector;
@@ -956,6 +961,11 @@ class Print;
         void process_G2_G3(const GCodeReader::GCodeLine& line, bool clockwise);
 
         void process_VG1(const GCodeReader::GCodeLine& line);
+
+        // Orca: thermal dwell guard (Stage 2). Stamp the anchor state snapshot + exclusion flag
+        // onto a freshly built TimeBlock from the current parser state. Shared by process_G1 and
+        // process_VG1 so the two paths agree byte-for-byte.
+        void stamp_thermal_dwell_state(TimeBlock& block) const;
 
 
         // BBS: handle delay command

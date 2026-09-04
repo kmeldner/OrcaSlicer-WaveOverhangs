@@ -194,12 +194,6 @@ static t_config_enum_values s_keys_map_WaveOverhangPattern {
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WaveOverhangPattern)
 
 // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6).
-static t_config_enum_values s_keys_map_ThermalDwellScope {
-    { "wave_overhang_only", int(ThermalDwellScope::WaveOverhangOnly) },
-    { "whole_print",        int(ThermalDwellScope::WholePrint) }
-};
-CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ThermalDwellScope)
-
 static t_config_enum_values s_keys_map_ThermalDwellReset {
     { "on_travel",       int(ThermalDwellReset::OnTravel) },
     { "on_fast_segment", int(ThermalDwellReset::OnFastSegment) },
@@ -5141,28 +5135,17 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
 
-    // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6). All options are inert while
-    // thermal_dwell_guard_enable is false; runtime behaviour is added in later stages.
+    // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6). Standalone module: it
+    // watches every move's flow rate and is not tied to wave overhangs (they are just one
+    // trigger). All options are inert while thermal_dwell_guard_enable is false.
     def = this->add("thermal_dwell_guard_enable", coBool);
     def->label = L("Enable thermal dwell guard");
     def->category = L("Strength");
-    def->tooltip = L("Insert periodic filament flushes during very-slow extrusion "
-                     "to prevent heat-creep jams. Off = stock behaviour.");
+    def->tooltip = L("Insert periodic filament flushes during very-slow extrusion (from any cause "
+                     "— slow walls, infill, bridges, overhangs, or wave overhangs) to prevent "
+                     "heat-creep jams. Off = stock behaviour.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
-
-    def = this->add("thermal_dwell_scope", coEnum);
-    def->label = L("Scope");
-    def->category = L("Strength");
-    def->tooltip = L("Where the guard is active. v1 scopes via the wave-overhang markers; "
-                     "whole-print scope is enabled later.");
-    def->enum_keys_map = &ConfigOptionEnum<ThermalDwellScope>::get_enum_values();
-    def->enum_values.push_back("wave_overhang_only");
-    def->enum_values.push_back("whole_print");
-    def->enum_labels.push_back(L("Wave overhang only"));
-    def->enum_labels.push_back(L("Whole print"));
-    def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionEnum<ThermalDwellScope>(ThermalDwellScope::WaveOverhangOnly));
 
     // TODO: candidate for per-filament coFloats
     def = this->add("thermal_dwell_flow_threshold", coFloat);
@@ -5233,6 +5216,20 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1.0));
 
+    // Machine flush/wipe position. Default = the Bambu X1C poop-chute XY, extracted from the
+    // bundled profile "resources/profiles/BBL/machine/Bambu Lab X1 Carbon 0.4 nozzle.json"
+    // (change_filament_gcode: G1 X70 ... / G1 Y245 -> Y265). Sits beyond the bed's Y edge at
+    // gantry level; the bed drops away below it, so it is reachable at any print height. Other
+    // printers derive their own later (Stage 2 targets the X1C). Keep in sync with
+    // THERMAL_DWELL_FALLBACK_FLUSH_POS in src/libslic3r/GCode/ThermalDwellGuard.hpp.
+    def = this->add("thermal_dwell_flush_position", coPoint);
+    def->label = L("Flush position");
+    def->category = L("Strength");
+    def->tooltip = L("Machine flush/wipe position the head travels to for a flush. Default is the "
+                     "Bambu X1C chute. Point it inside the printed bounding box at your own risk.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPoint(Vec2d(70., 265.)));
+
     def = this->add("thermal_dwell_purge_volume", coFloat);
     def->label = L("Purge volume");
     def->category = L("Strength");
@@ -5255,8 +5252,8 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def = this->add("thermal_dwell_wipe", coBool);
     def->label = L("Wipe after purge");
     def->category = L("Strength");
-    def->tooltip = L("Wipe the nozzle after purging, before returning. The wipe sequence is reused "
-                     "from the selected printer's filament-change G-code.");
+    def->tooltip = L("Wipe the nozzle on the machine wiper at the flush position after purging, "
+                     "before returning. Uses the built-in Bambu X1C wiper pattern (motion only).");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
 

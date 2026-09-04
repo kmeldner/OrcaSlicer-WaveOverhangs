@@ -1030,13 +1030,13 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     // (docs/thermal_dwell_guard/SPEC.md §6)
     const bool td_enabled = config->opt_bool("thermal_dwell_guard_enable");
     for (const std::string &k : {
-        std::string("thermal_dwell_scope"),
         std::string("thermal_dwell_flow_threshold"),
         std::string("thermal_dwell_max_time"),
         std::string("thermal_dwell_fast_flow_threshold"),
         std::string("thermal_dwell_reset_mode"),
         std::string("thermal_dwell_melt_zone_volume"),
         std::string("thermal_dwell_flush_z_lift"),
+        std::string("thermal_dwell_flush_position"),
         std::string("thermal_dwell_purge_volume"),
         std::string("thermal_dwell_purge_flow"),
         std::string("thermal_dwell_wipe"),

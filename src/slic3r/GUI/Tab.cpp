@@ -2487,25 +2487,34 @@ void TabPrint::build()
         optgroup->append_single_option_line("wave_overhang_floor_fan_speed");
         optgroup->append_single_option_line("wave_overhang_floor_aux_fan_speed");
 
-        // Thermal dwell guard: pre-inject filament flushes during very-slow extrusion to
-        // prevent heat-creep jams. Scoped to wave-overhang regions in v1, so it lives here.
-        optgroup = page->new_optgroup(L("Thermal dwell guard"), L"param_overhang");
+        optgroup = page->new_optgroup(L("Debug"), L"param_overhang");
+        optgroup->append_single_option_line("wave_overhang_debug_gcode");
+
+    // Thermal dwell guard: a STANDALONE module (Stage 2) that pre-injects filament flushes
+    // during very-slow extrusion from ANY cause to prevent heat-creep jams. It no longer
+    // depends on wave overhangs, so it gets its own page as a peer of "Wave overhangs" rather
+    // than a nested group. Master toggle reveals the tunables (gated in ConfigManipulation).
+    page = add_options_page(L("Thermal dwell guard"), "custom-gcode_quality");
+        optgroup = page->new_optgroup(L("General"), L"param_overhang");
         optgroup->append_single_option_line("thermal_dwell_guard_enable");
-        optgroup->append_single_option_line("thermal_dwell_scope");
+
+        optgroup = page->new_optgroup(L("Trigger"), L"param_overhang");
         optgroup->append_single_option_line("thermal_dwell_flow_threshold");
         optgroup->append_single_option_line("thermal_dwell_max_time");
         optgroup->append_single_option_line("thermal_dwell_fast_flow_threshold");
         optgroup->append_single_option_line("thermal_dwell_reset_mode");
         optgroup->append_single_option_line("thermal_dwell_melt_zone_volume");
+
+        optgroup = page->new_optgroup(L("Flush action"), L"param_overhang");
         optgroup->append_single_option_line("thermal_dwell_flush_z_lift");
+        optgroup->append_single_option_line("thermal_dwell_flush_position");
         optgroup->append_single_option_line("thermal_dwell_purge_volume");
         optgroup->append_single_option_line("thermal_dwell_purge_flow");
         optgroup->append_single_option_line("thermal_dwell_wipe");
+
+        optgroup = page->new_optgroup(L("Scheduling"), L"param_overhang");
         optgroup->append_single_option_line("thermal_dwell_schedule_mode");
         optgroup->append_single_option_line("thermal_dwell_lookahead");
-
-        optgroup = page->new_optgroup(L("Debug"), L"param_overhang");
-        optgroup->append_single_option_line("wave_overhang_debug_gcode");
 
     page = add_options_page(L("Strength"), "custom-gcode_strength"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Walls"), L"param_wall");

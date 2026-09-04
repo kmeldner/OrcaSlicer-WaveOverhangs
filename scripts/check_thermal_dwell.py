@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""Independently verify the thermal dwell guard's markers in a sliced G-code file.
+"""Independently verify the thermal dwell guard's markers and flush blocks in a G-code file.
 
-This is a deliberate second implementation of the accumulator (see
-docs/thermal_dwell_guard/STAGE1.md §4 and §6a). It re-walks the G-code with a NAIVE time
-model -- distance / feedrate, no acceleration -- and checks the slicer's markers against it.
-Because the slicer's estimate IS acceleration-aware, the two never agree exactly; the
-comparison is tolerance-based (default +/-25%, see --tolerance).
+This is a deliberate second implementation of the accumulator + flush sequence (see
+docs/thermal_dwell_guard/STAGE1.md §4/§6 and STAGE2.md §5/§9). It re-walks the G-code with a
+NAIVE time model -- distance / feedrate, no acceleration -- and checks the slicer's markers and
+inserted flush blocks against it. Because the slicer's estimate IS acceleration-aware, the two
+never agree exactly on `acc`; that comparison is tolerance-based (default +/-25%, --tolerance).
 
-Checks performed:
+Stage 2 (standalone guard, chute-based flush injection). Checks performed:
   1. every FLUSH_POINT's acc is close to max_time, and close to the naive recomputation
-  2. with scope=WaveOverhangOnly, every marker's episode accrued time inside a wave region
-  3. the inline FLUSH_POINT count equals the SUMMARY count
-  4. ids are 1..N consecutive and the inline markers agree with the SUMMARY entries
+  2. the inline FLUSH_POINT count equals the SUMMARY count
+  3. ids are 1..N consecutive and the inline markers agree with the SUMMARY entries
+  4. per flush block (FLUSH_START..FLUSH_END): markers paired; explicit F on every inserted
+     move; travel reaches the configured flush position; wipe pattern present when enabled;
+     purge E total == purge_volume/A within 1%; block restores XY/Z to the anchor; retract
+     balances back to the anchor's retract state; absolute-E blocks carry `G92 E<anchor>` and
+     relative-E blocks do not; the final `G1 F` restores the anchor's modal feedrate
+  5. invariant-3 scan: no M104/M109/M140/M106/M620/M621 or filament-cut moves inside any block
+  6. (optional, --baseline) pure insertion: stripping the guard's inserted lines from this file
+     yields the guard-OFF baseline byte-for-byte
+
+Stage 2 dropped the scope option, so the old wave-region containment check is gone.
 
 Usage:
-    python3 check_thermal_dwell.py <file.gcode> [--tolerance 0.25] [--verbose]
+    python3 check_thermal_dwell.py <file.gcode> [--baseline off.gcode] [--tolerance 0.25] [-v]
 """
 
 import argparse
@@ -23,31 +32,47 @@ import re
 import sys
 
 DEFAULT_TOLERANCE = 0.25
+PURGE_TOLERANCE = 0.01  # ±1% on the purge volume (STAGE2 §9a)
 
-# Marker grammar (STAGE1 §5). These strings are load-bearing: Stage 2 replaces the flush-point
-# comments with real flush sequences, so keep them in sync with ThermalDwellGuard.
+# Marker grammar (STAGE2 §7). Load-bearing: keep in sync with ThermalDwellGuard.
 RE_CONFIG = re.compile(
-    r"^;THERMAL_DWELL_CONFIG scope=(\S+) flow_max=(\S+) fast_min=(\S+) "
-    r"max_time=(\S+) reset=(\S+) melt_zone=(\S+)"
+    r"^;THERMAL_DWELL_CONFIG flow_max=(\S+) fast_min=(\S+) max_time=(\S+) reset=(\S+) "
+    r"melt_zone=(\S+) flush_pos=(\S+) z_lift=(\S+) purge_vol=(\S+) purge_flow=(\S+) wipe=(\d+)"
 )
 RE_FLUSH_POINT = re.compile(
     r"^;THERMAL_DWELL_FLUSH_POINT id=(\d+) acc=([\d.]+)s layer=(\d+) z=([\d.-]+)"
 )
-RE_SUMMARY = re.compile(r"^;THERMAL_DWELL_SUMMARY count=(\d+)")
+RE_FLUSH_START = re.compile(r"^;THERMAL_DWELL_FLUSH_START id=(\d+)")
+RE_FLUSH_END = re.compile(r"^;THERMAL_DWELL_FLUSH_END id=(\d+)")
+RE_SUMMARY = re.compile(
+    r"^;THERMAL_DWELL_SUMMARY count=(\d+)(?: total_purge_mm3=(\S+) est_added_time_s=(\S+))?"
+)
 RE_POINT = re.compile(
     r"^;THERMAL_DWELL_POINT id=(\d+) layer=(\d+) z=([\d.-]+) acc=([\d.]+)"
 )
-
-# Wave-overhang region markers as GCode::_extrude() actually emits them. The space after the
-# semicolon is real -- matching ";WAVE_OVERHANG_START" finds nothing.
-WAVE_START = "; WAVE_OVERHANG_START"
-WAVE_END = "; WAVE_OVERHANG_END"
 
 # Filament diameter is needed to turn dE into mm^3 and is NOT part of the CONFIG echo; it comes
 # from the config block Orca appends to the end of the file.
 RE_FIL_DIAM = re.compile(r"^; filament_diameter\s*=\s*([\d.]+)")
 
 RE_WORD = re.compile(r"([A-Za-z])\s*(-?[\d.]+)")
+
+# Any THERMAL_DWELL_* line the guard inserts (used by the pure-insertion check).
+RE_TD_ANY = re.compile(r"^;THERMAL_DWELL_")
+
+# Orca's embedded config-block dump lines ("; key = value"). These legitimately differ between a
+# guard-ON and guard-OFF slice (the enable flag + any changed thermal_dwell_* values), and SPEC
+# §6 explicitly carves them out of the byte-identical guarantee, so the pure-insertion check
+# ignores them in BOTH files and compares only the real toolpath + our inserted blocks.
+RE_CONFIG_DUMP = re.compile(r"^;\s*[A-Za-z0-9_]+\s*=")
+
+# Non-deterministic header lines that differ between any two slices of the same input (wall-clock
+# stamp), independent of the guard. Excluded from the pure-insertion comparison in both files.
+RE_VOLATILE = re.compile(r"^; generated by ")
+
+# Invariant-3 (STAGE2 §3): commands a flush must NEVER contain -- temperatures, fans, AMS,
+# filament cut. Matched as whole G/M-codes at the start of a stripped line.
+RE_FORBIDDEN = re.compile(r"^(M104|M109|M140|M190|M106|M620|M621|M628|M629|G29)\b")
 
 
 def print_error(msg):
@@ -69,7 +94,7 @@ def parse_words(line):
 
 
 class NaiveAccumulator:
-    """The §4 state machine again, fed by a no-acceleration time model.
+    """The §4 state machine again (standalone: no scope), fed by a no-acceleration time model.
 
     Mirrors ThermalDwellAccumulator deliberately rather than sharing code: a bug copied into
     both implementations would be invisible, which would defeat the point of this script.
@@ -80,22 +105,14 @@ class NaiveAccumulator:
         self.acc = 0.0
         self.fast_vol = 0.0
         self.count = 0
-        # Seconds of THIS episode accrued inside a wave region. Reset with acc. Used for
-        # check 2: a positional "marker is near a wave region" test would be wrong, because
-        # row 7 lets an episode span an unbounded travel or layer change.
-        self.episode_wave_s = 0.0
 
-    def step(self, is_extrusion, duration, volume, in_wave):
+    def step(self, is_extrusion, duration, volume):
         if is_extrusion:
             q = volume / duration if duration > 0.0 else math.inf
             if q <= self.cfg["q_slow"]:
                 self.fast_vol = 0.0
-                if self.cfg["scope"] == "WholePrint" or in_wave:
-                    self.acc += duration
-                    if in_wave:
-                        self.episode_wave_s += duration
-                    return self._check()
-                return None
+                self.acc += duration
+                return self._check()
             if q < self.cfg["q_fast"]:
                 return None
             if self.cfg["reset"] == "OnVolume":
@@ -118,13 +135,12 @@ class NaiveAccumulator:
     def _reset_episode(self):
         self.acc = 0.0
         self.fast_vol = 0.0
-        self.episode_wave_s = 0.0
 
     def _check(self):
         if self.cfg["t_max"] <= 0.0 or self.acc < self.cfg["t_max"]:
             return None
         self.count += 1
-        event = {"id": self.count, "acc": self.acc, "wave_s": self.episode_wave_s}
+        event = {"id": self.count, "acc": self.acc}
         self._reset_episode()
         return event
 
@@ -133,13 +149,18 @@ def parse_config(lines):
     for line in lines:
         m = RE_CONFIG.match(line)
         if m:
+            fx, fy = (float(v) for v in m.group(6).split(","))
             return {
-                "scope": m.group(1),
-                "q_slow": float(m.group(2)),
-                "q_fast": float(m.group(3)),
-                "t_max": float(m.group(4)),
-                "reset": m.group(5),
-                "v_melt": float(m.group(6)),
+                "q_slow": float(m.group(1)),
+                "q_fast": float(m.group(2)),
+                "t_max": float(m.group(3)),
+                "reset": m.group(4),
+                "v_melt": float(m.group(5)),
+                "flush_pos": (fx, fy),
+                "z_lift": float(m.group(7)),
+                "purge_vol": float(m.group(8)),
+                "purge_flow": float(m.group(9)),
+                "wipe": bool(int(m.group(10))),
             }
     return None
 
@@ -152,30 +173,40 @@ def filament_diameter(lines):
     return None
 
 
+def move_deltas(words, pos, absolute_xyz, absolute_e):
+    delta = {}
+    for axis in ("X", "Y", "Z", "E"):
+        if axis not in words:
+            delta[axis] = 0.0
+            continue
+        absolute = absolute_xyz if axis != "E" else absolute_e
+        delta[axis] = words[axis] - pos[axis] if absolute else words[axis]
+    return delta
+
+
 def recompute(lines, cfg, diameter):
-    """Walk the G-code with a naive time model, returning the events it would produce."""
+    """Walk the ORIGINAL G-code (skipping inserted flush blocks) with a naive time model."""
     acc = NaiveAccumulator(cfg)
     area = math.pi * (0.5 * diameter) ** 2
     pos = {"X": 0.0, "Y": 0.0, "Z": 0.0, "E": 0.0}
     feedrate = 0.0  # mm/min
     absolute_xyz = True
     absolute_e = True
-    in_wave = False
+    in_block = False
     events = []
 
     for raw in lines:
         line = raw.strip()
-        if line.startswith(WAVE_START):
-            in_wave = True
+        if RE_FLUSH_START.match(line):
+            in_block = True
             continue
-        if line.startswith(WAVE_END):
-            in_wave = False
+        if RE_FLUSH_END.match(line):
+            in_block = False
             continue
-        if not line or line.startswith(";"):
+        if in_block or not line or line.startswith(";"):
             continue
 
         cmd = line.split()[0].upper()
-
         if cmd == "G90":
             absolute_xyz = True
             continue
@@ -194,11 +225,10 @@ def recompute(lines, cfg, diameter):
                     pos[axis] = value
             continue
         if cmd == "G4":
-            # Mirrors the guard's additional_time handling: a dwell is non-extruding time.
             words = parse_words(line)
             dwell = words.get("S", 0.0) + words.get("P", 0.0) / 1000.0
             if dwell > 0.0:
-                ev = acc.step(False, dwell, 0.0, in_wave)
+                ev = acc.step(False, dwell, 0.0)
                 if ev:
                     events.append(ev)
             continue
@@ -208,48 +238,269 @@ def recompute(lines, cfg, diameter):
         words = parse_words(line)
         if "F" in words:
             feedrate = words["F"]
-
-        delta = {}
-        for axis in ("X", "Y", "Z", "E"):
-            if axis not in words:
-                delta[axis] = 0.0
-                continue
-            absolute = absolute_xyz if axis != "E" else absolute_e
-            delta[axis] = words[axis] - pos[axis] if absolute else words[axis]
-
+        delta = move_deltas(words, pos, absolute_xyz, absolute_e)
         for axis in ("X", "Y", "Z", "E"):
             pos[axis] += delta[axis]
 
         dist_xyz = math.sqrt(delta["X"] ** 2 + delta["Y"] ** 2 + delta["Z"] ** 2)
         if dist_xyz == 0.0 and delta["E"] == 0.0:
             continue
-
-        # Classification mirrors GCodeProcessor's move_type lambda: extrusion requires
-        # positive E together with XY motion; everything else is non-extruding.
         is_extrusion = delta["E"] > 0.0 and (delta["X"] != 0.0 or delta["Y"] != 0.0)
         length = dist_xyz if dist_xyz > 0.0 else abs(delta["E"])
         if feedrate <= 0.0:
             continue
         duration = length / (feedrate / 60.0)
         volume = area * delta["E"] if is_extrusion else 0.0
-
-        ev = acc.step(is_extrusion, duration, volume, in_wave)
+        ev = acc.step(is_extrusion, duration, volume)
         if ev:
             events.append(ev)
 
     return events
 
 
+def collect_anchors_and_blocks(lines):
+    """Walk the file, tracking ORIGINAL modal state, and pair each block with its anchor state.
+
+    Returns (blocks, structural_failures). Each block is a dict with the anchor snapshot (state
+    just before the FLUSH_POINT) and the raw inserted lines between FLUSH_START and FLUSH_END.
+    """
+    pos = {"X": 0.0, "Y": 0.0, "Z": 0.0, "E": 0.0}
+    feedrate = 0.0
+    absolute_xyz = True
+    absolute_e = True
+    retracted = False
+
+    blocks = []
+    failures = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i].strip()
+        fp = RE_FLUSH_POINT.match(line)
+        if fp:
+            anchor = {
+                "id": int(fp.group(1)),
+                "pos": dict(pos),
+                "feedrate": feedrate,
+                "absolute_e": absolute_e,
+                "retracted": retracted,
+            }
+            # Expect FLUSH_START next, then body, then FLUSH_END.
+            j = i + 1
+            if j >= n or not RE_FLUSH_START.match(lines[j].strip()):
+                failures.append(f"id={anchor['id']}: FLUSH_POINT not followed by FLUSH_START")
+                i += 1
+                continue
+            start_id = int(RE_FLUSH_START.match(lines[j].strip()).group(1))
+            body = []
+            j += 1
+            while j < n and not RE_FLUSH_END.match(lines[j].strip()):
+                body.append(lines[j].strip())
+                j += 1
+            if j >= n:
+                failures.append(f"id={anchor['id']}: FLUSH_START without a matching FLUSH_END")
+                break
+            end_id = int(RE_FLUSH_END.match(lines[j].strip()).group(1))
+            if not (anchor["id"] == start_id == end_id):
+                failures.append(
+                    f"id mismatch across markers: POINT={anchor['id']} START={start_id} END={end_id}"
+                )
+            blocks.append({"anchor": anchor, "body": body})
+            i = j + 1
+            continue
+
+        # An ordinary line advances the original-stream modal state (blocks are pure insertion,
+        # so they never touch it -- that is exactly Invariant 2).
+        if line and not line.startswith(";"):
+            cmd = line.split()[0].upper()
+            if cmd == "G90":
+                absolute_xyz = True
+            elif cmd == "G91":
+                absolute_xyz = False
+            elif cmd == "M82":
+                absolute_e = True
+            elif cmd == "M83":
+                absolute_e = False
+            elif cmd == "G92":
+                for axis, value in parse_words(line).items():
+                    if axis in pos:
+                        pos[axis] = value
+            elif cmd in ("G0", "G1"):
+                words = parse_words(line)
+                if "F" in words:
+                    feedrate = words["F"]
+                delta = move_deltas(words, pos, absolute_xyz, absolute_e)
+                for axis in ("X", "Y", "Z", "E"):
+                    pos[axis] += delta[axis]
+                dxyz = delta["X"] != 0.0 or delta["Y"] != 0.0 or delta["Z"] != 0.0
+                if delta["E"] < 0.0 and not dxyz:
+                    retracted = True
+                elif delta["E"] > 0.0 and delta["X"] == 0.0 and delta["Y"] == 0.0 and delta["Z"] == 0.0:
+                    retracted = False
+        i += 1
+
+    return blocks, failures
+
+
+def check_block(block, cfg, area, failures):
+    """Validate one inserted flush block against STAGE2 §5/§9 (self-contained per block)."""
+    anchor = block["anchor"]
+    bid = anchor["id"]
+    body = block["body"]
+
+    absolute_e = anchor["absolute_e"]
+    # Simulate the block's own effect, starting from the anchor state.
+    pos = dict(anchor["pos"])
+    retracted = anchor["retracted"]
+    absx = True  # blocks always emit absolute-XYZ G1 targets
+    saw_g92 = None
+    last_f = None
+    purge_e = 0.0
+    reached_x = reached_y = False
+    wipe_moves = 0
+    flush_x, flush_y = cfg["flush_pos"]
+    purge_feed = round(cfg["purge_flow"] / area * 60.0) if area > 0 else 0
+
+    for line in body:
+        if not line or line.startswith(";"):
+            continue
+        if RE_FORBIDDEN.match(line):
+            failures.append(f"id={bid}: forbidden command inside flush block: '{line}'")
+        cmd = line.split()[0].upper()
+        if cmd == "G92":
+            words = parse_words(line)
+            if "E" in words:
+                saw_g92 = words["E"]
+                pos["E"] = words["E"]
+            continue
+        if cmd not in ("G0", "G1"):
+            continue
+        words = parse_words(line)
+        # Explicit F on every inserted move (unless it is a pure E/G92 helper -- but all our
+        # moves carry F, including the final modal-F restore).
+        if "F" not in words:
+            failures.append(f"id={bid}: inserted move without explicit F: '{line}'")
+        else:
+            last_f = words["F"]
+        delta = move_deltas(words, pos, absx, absolute_e)
+        for axis in ("X", "Y", "Z", "E"):
+            pos[axis] += delta[axis]
+        # Purge = the E move at the purge feedrate.
+        if "F" in words and round(words["F"]) == purge_feed and delta["E"] > 0.0:
+            purge_e += delta["E"]
+        # Retract state through the block (same classification as the original stream).
+        dxyz = delta["X"] != 0.0 or delta["Y"] != 0.0 or delta["Z"] != 0.0
+        if delta["E"] < 0.0 and not dxyz:
+            retracted = True
+        elif delta["E"] > 0.0 and delta["X"] == 0.0 and delta["Y"] == 0.0 and delta["Z"] == 0.0:
+            retracted = False
+        # Flush-position reach + wipe detection.
+        if abs(pos["X"] - flush_x) < 1e-2:
+            reached_x = True
+        if abs(pos["Y"] - flush_y) < 1e-2:
+            reached_y = True
+        if "X" in words and "Y" in words and abs(pos["Y"] - flush_y) < 1e-2 and delta["X"] != 0.0:
+            wipe_moves += 1
+
+    # Travel reached the configured flush position.
+    if not (reached_x and reached_y):
+        failures.append(
+            f"id={bid}: block never reached the flush position {flush_x},{flush_y}"
+        )
+    # Wipe pattern present iff enabled.
+    if cfg["wipe"] and wipe_moves < 2:
+        failures.append(f"id={bid}: wipe enabled but no wiper sweep found in block")
+    # Purge volume within ±1%.
+    want_e = cfg["purge_vol"] / area if area > 0 else 0.0
+    if want_e > 0.0 and abs(purge_e - want_e) / want_e > PURGE_TOLERANCE:
+        failures.append(
+            f"id={bid}: purge E {purge_e:.4f}mm != purge_volume/A {want_e:.4f}mm "
+            f"(>{PURGE_TOLERANCE:.0%})"
+        )
+    # Block restores XY/Z to the anchor.
+    for axis in ("X", "Y", "Z"):
+        if abs(pos[axis] - anchor["pos"][axis]) > 1e-2:
+            failures.append(
+                f"id={bid}: {axis} not restored ({pos[axis]:.3f} != anchor {anchor['pos'][axis]:.3f})"
+            )
+    # Retract balances back to the anchor state.
+    if retracted != anchor["retracted"]:
+        failures.append(
+            f"id={bid}: retract state not restored (block={retracted}, anchor={anchor['retracted']})"
+        )
+    # E bookkeeping: absolute-E needs G92 E<anchor>; relative-E must not carry one.
+    if absolute_e:
+        if saw_g92 is None:
+            failures.append(f"id={bid}: absolute-E block missing mandatory 'G92 E<anchor>'")
+        elif abs(saw_g92 - anchor["pos"]["E"]) > 1e-3:
+            failures.append(
+                f"id={bid}: G92 E{saw_g92:.5f} != anchor logical E {anchor['pos']['E']:.5f}"
+            )
+    elif saw_g92 is not None:
+        failures.append(f"id={bid}: relative-E block should not emit G92 (found E{saw_g92})")
+    # Final modal-F restore matches the anchor.
+    if last_f is None or round(last_f) != round(anchor["feedrate"]):
+        failures.append(
+            f"id={bid}: final modal F {last_f} != anchor feedrate {anchor['feedrate']}"
+        )
+
+
+def _strip_for_insertion(lines, drop_td):
+    """Return the toolpath lines only: drop inserted thermal-dwell blocks/markers (guard-ON) and
+    the config-block metadata dump (both files, per SPEC §6)."""
+    out = []
+    in_block = False
+    for raw in lines:
+        s = raw.strip()
+        if drop_td and RE_FLUSH_START.match(s):
+            in_block = True
+            continue
+        if drop_td and RE_FLUSH_END.match(s):
+            in_block = False
+            continue
+        if in_block:
+            continue
+        if drop_td and RE_TD_ANY.match(s):  # CONFIG echo, FLUSH_POINT, SUMMARY, POINT lines
+            continue
+        if RE_CONFIG_DUMP.match(s) or RE_VOLATILE.match(s):
+            continue
+        out.append(raw)
+    return out
+
+
+def check_pure_insertion(lines, baseline_path, failures):
+    """Stripping every guard-inserted line must reproduce the guard-OFF baseline's toolpath."""
+    with open(baseline_path, encoding="utf-8", errors="replace") as f:
+        baseline = f.read().splitlines()
+
+    stripped = _strip_for_insertion(lines, drop_td=True)
+    base_toolpath = _strip_for_insertion(baseline, drop_td=True)
+
+    if stripped == base_toolpath:
+        print_ok(
+            f"check 6: pure insertion -- guard-ON toolpath == baseline toolpath "
+            f"({len(base_toolpath)} lines, config-dump metadata excluded)"
+        )
+        return
+    for idx, (a, b) in enumerate(zip(stripped, base_toolpath)):
+        if a != b:
+            failures.append(f"pure-insertion mismatch at toolpath line {idx + 1}: '{a}' != baseline '{b}'")
+            break
+    else:
+        failures.append(
+            f"pure-insertion length mismatch: stripped {len(stripped)} vs baseline {len(base_toolpath)}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("gcode", help="path to a sliced G-code file")
+    parser.add_argument("gcode", help="path to a sliced (guard-ON) G-code file")
+    parser.add_argument("--baseline", help="guard-OFF slice of the same model, for the pure-insertion check")
     parser.add_argument(
-        "--tolerance",
-        type=float,
-        default=DEFAULT_TOLERANCE,
+        "--tolerance", type=float, default=DEFAULT_TOLERANCE,
         help="relative tolerance for acc comparisons (default %(default)s)",
     )
-    parser.add_argument("--verbose", action="store_true", help="print every marker")
+    parser.add_argument("--verbose", "-v", action="store_true", help="print every marker")
     args = parser.parse_args()
 
     with open(args.gcode, encoding="utf-8", errors="replace") as f:
@@ -260,35 +511,25 @@ def main():
         print_error("no ;THERMAL_DWELL_CONFIG line found -- was the guard enabled?")
         return 2
     print_info(
-        f"config: scope={cfg['scope']} reset={cfg['reset']} q_slow={cfg['q_slow']} "
-        f"q_fast={cfg['q_fast']} t_max={cfg['t_max']} v_melt={cfg['v_melt']}"
+        f"config: reset={cfg['reset']} q_slow={cfg['q_slow']} q_fast={cfg['q_fast']} "
+        f"t_max={cfg['t_max']} v_melt={cfg['v_melt']} flush_pos={cfg['flush_pos']} "
+        f"purge_vol={cfg['purge_vol']} purge_flow={cfg['purge_flow']} wipe={cfg['wipe']}"
     )
 
     diameter = filament_diameter(lines)
     if diameter is None:
         print_error("no '; filament_diameter = ' in the config block; cannot convert dE to mm^3")
         return 2
-    print_info(f"filament diameter: {diameter} mm")
+    area = math.pi * (0.5 * diameter) ** 2
+    print_info(f"filament diameter: {diameter} mm (area {area:.4f} mm^2)")
 
     inline = [
-        {
-            "id": int(m.group(1)),
-            "acc": float(m.group(2)),
-            "layer": int(m.group(3)),
-            "z": float(m.group(4)),
-        }
-        for m in (RE_FLUSH_POINT.match(l) for l in lines)
-        if m
+        {"id": int(m.group(1)), "acc": float(m.group(2)), "layer": int(m.group(3)), "z": float(m.group(4))}
+        for m in (RE_FLUSH_POINT.match(l) for l in lines) if m
     ]
     summary_points = [
-        {
-            "id": int(m.group(1)),
-            "layer": int(m.group(2)),
-            "z": float(m.group(3)),
-            "acc": float(m.group(4)),
-        }
-        for m in (RE_POINT.match(l) for l in lines)
-        if m
+        {"id": int(m.group(1)), "layer": int(m.group(2)), "z": float(m.group(3)), "acc": float(m.group(4))}
+        for m in (RE_POINT.match(l) for l in lines) if m
     ]
     summary_count = None
     for line in lines:
@@ -299,35 +540,27 @@ def main():
 
     if args.verbose:
         for point in inline:
-            print_info(
-                f"  FLUSH_POINT id={point['id']} acc={point['acc']}s "
-                f"layer={point['layer']} z={point['z']}"
-            )
+            print_info(f"  FLUSH_POINT id={point['id']} acc={point['acc']}s layer={point['layer']} z={point['z']}")
 
     naive_events = recompute(lines, cfg, diameter)
-
     failures = []
 
-    # --- Check 1: acc lands at the limit, and the naive model roughly agrees -------------
+    # --- Check 1: acc lands at the limit, and the naive model roughly agrees --------------
     for point in inline:
         if point["acc"] < cfg["t_max"]:
-            failures.append(
-                f"id={point['id']}: acc {point['acc']}s < max_time {cfg['t_max']}s "
-                "(the accumulator fires at >= max_time)"
-            )
+            failures.append(f"id={point['id']}: acc {point['acc']}s < max_time {cfg['t_max']}s")
         elif point["acc"] > cfg["t_max"] * (1.0 + args.tolerance):
             failures.append(
                 f"id={point['id']}: acc {point['acc']}s overshoots max_time {cfg['t_max']}s "
-                f"by more than {args.tolerance:.0%} (max one move's overshoot is expected)"
+                f"by more than {args.tolerance:.0%}"
             )
-    if not failures:
+    if not any(f.startswith("id=") for f in failures):
         print_ok(f"check 1a: all {len(inline)} marker(s) fire in [max_time, +{args.tolerance:.0%}]")
 
     if len(naive_events) != len(inline):
         print_info(
             f"check 1b: naive model found {len(naive_events)} event(s) vs {len(inline)} marker(s); "
-            "counts may differ legitimately (accel-aware vs naive timing), comparing pairwise "
-            "where both exist"
+            "counts may differ legitimately (accel-aware vs naive timing)"
         )
     mismatches = []
     for point, ev in zip(inline, naive_events):
@@ -336,37 +569,22 @@ def main():
         rel = abs(point["acc"] - ev["acc"]) / ev["acc"]
         if rel > args.tolerance:
             mismatches.append(
-                f"id={point['id']}: slicer acc {point['acc']:.2f}s vs naive {ev['acc']:.2f}s "
-                f"({rel:.0%} apart, tolerance {args.tolerance:.0%})"
+                f"id={point['id']}: slicer acc {point['acc']:.2f}s vs naive {ev['acc']:.2f}s ({rel:.0%} apart)"
             )
     if mismatches:
         failures.extend(mismatches)
     elif naive_events:
         print_ok(f"check 1b: slicer acc within {args.tolerance:.0%} of the naive recomputation")
 
-    # --- Check 2: markers are caused by wave-region time ---------------------------------
-    if cfg["scope"] == "WaveOverhangOnly":
-        bad = [ev["id"] for ev in naive_events if ev["wave_s"] <= 0.0]
-        if bad:
-            failures.append(
-                f"scope=WaveOverhangOnly but episode(s) {bad} accrued no time inside a wave region"
-            )
-        else:
-            print_ok("check 2: every episode accrued time inside a wave region")
-    else:
-        print_info("check 2: skipped (scope != WaveOverhangOnly)")
-
-    # --- Check 3: inline count == SUMMARY count ------------------------------------------
+    # --- Check 2: inline count == SUMMARY count ------------------------------------------
     if summary_count is None:
         failures.append("no ;THERMAL_DWELL_SUMMARY line found")
     elif summary_count != len(inline):
-        failures.append(
-            f"SUMMARY count={summary_count} but {len(inline)} inline FLUSH_POINT marker(s)"
-        )
+        failures.append(f"SUMMARY count={summary_count} but {len(inline)} inline FLUSH_POINT marker(s)")
     else:
-        print_ok(f"check 3: inline marker count matches SUMMARY count ({summary_count})")
+        print_ok(f"check 2: inline marker count matches SUMMARY count ({summary_count})")
 
-    # --- Check 4: ids consecutive, inline agrees with SUMMARY ----------------------------
+    # --- Check 3: ids consecutive, inline agrees with SUMMARY ----------------------------
     expected_ids = list(range(1, len(inline) + 1))
     if [p["id"] for p in inline] != expected_ids:
         failures.append(f"inline ids are not 1..N consecutive: {[p['id'] for p in inline]}")
@@ -382,7 +600,27 @@ def main():
         if disagreements:
             failures.extend(disagreements)
         else:
-            print_ok("check 4: ids are 1..N and inline markers agree with the SUMMARY block")
+            print_ok("check 3: ids are 1..N and inline markers agree with the SUMMARY block")
+
+    # --- Checks 4 & 5: per-block invariants + invariant-3 scan ----------------------------
+    blocks, struct_fail = collect_anchors_and_blocks(lines)
+    failures.extend(struct_fail)
+    if len(blocks) != len(inline):
+        failures.append(f"found {len(blocks)} FLUSH_START/END block(s) but {len(inline)} FLUSH_POINT(s)")
+    block_fail_before = len(failures)
+    for block in blocks:
+        check_block(block, cfg, area, failures)
+    if len(failures) == block_fail_before and blocks:
+        print_ok(
+            f"checks 4 & 5: all {len(blocks)} flush block(s) valid "
+            "(paired, explicit F, chute travel, purge, XY/Z + retract + E + F restored, no forbidden cmds)"
+        )
+
+    # --- Check 6: pure insertion vs baseline (optional) ----------------------------------
+    if args.baseline:
+        check_pure_insertion(lines, args.baseline, failures)
+    else:
+        print_info("check 6: skipped (no --baseline given for the pure-insertion test)")
 
     print()
     if failures:
@@ -391,7 +629,7 @@ def main():
         print(f"\n\033[91mFAILED\033[0m: {len(failures)} problem(s) found")
         return 1
 
-    print(f"\033[92mPASS\033[0m: {len(inline)} flush point(s) verified")
+    print(f"\033[92mPASS\033[0m: {len(inline)} flush point(s) and block(s) verified")
     return 0
 
 

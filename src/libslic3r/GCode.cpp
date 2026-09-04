@@ -2525,7 +2525,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // decides whether GCodeProcessor builds a guard at all, so this line always describes what
     // actually ran. Emitted only when the guard is on, so guard-off output is untouched.
     if (const std::optional<ThermalDwell::Config> td_cfg = ThermalDwellGuard::resolve_config(print))
-        file.write(ThermalDwellGuard::format_config_comment(*td_cfg));
+        file.write(ThermalDwellGuard::format_config_comment(
+            *td_cfg, ThermalDwellGuard::resolve_flush_params(print)));
 
     if(!has_BTT_thumbnail){
         file.write_format("; HEADER_BLOCK_START\n");
@@ -6370,17 +6371,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     if (!path.wave_overhang)
         gcode += wave_temp_restore_gcode();
 
-    // Orca: wave-overhang debug-gcode markers (per-path scope).
-    // The thermal dwell guard consumes these same START/END markers as its scope signal when
-    // thermal_dwell_scope = WaveOverhangOnly, so they must be emitted for the guard even when
-    // the debug toggle is off: they stop being debug output the moment something reads them,
-    // and gating a functional input on a debug switch would make the guard silently no-op on a
-    // setting unrelated to it. With the guard off this reduces to the original condition, so
-    // guard-off output stays byte-identical to stock by construction.
-    const bool wave_markers_for_guard = m_config.thermal_dwell_guard_enable.value &&
-                                        m_config.thermal_dwell_scope.value == ThermalDwellScope::WaveOverhangOnly;
-    const bool emit_wave_overhang_markers = path.wave_overhang &&
-                                            (m_config.wave_overhang_debug_gcode.value || wave_markers_for_guard);
+    // Orca: wave-overhang debug-gcode markers (per-path scope). Purely a debug aid again as of
+    // Stage 2: the thermal dwell guard is standalone and no longer consumes these markers, so
+    // they revert to being gated solely on the wave_overhang_debug_gcode toggle.
+    const bool emit_wave_overhang_markers = path.wave_overhang && m_config.wave_overhang_debug_gcode.value;
     if (emit_wave_overhang_markers)
         gcode += "; WAVE_OVERHANG_START\n";
 

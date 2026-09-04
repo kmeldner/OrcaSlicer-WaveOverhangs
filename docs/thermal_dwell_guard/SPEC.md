@@ -30,14 +30,18 @@ G-code before it ever reaches the printer.** No sensors, no firmware changes.
 
 ## 3. Behaviour
 
-While the guard is active (see scope), track cumulative time spent extruding at or below a
-slow-flow threshold. When that accumulated time exceeds a safe limit:
+The guard is a **standalone** module (Stage 2 onward): it watches every move's volumetric flow
+across the whole print — there is no scope option and no dependency on wave-overhang markers.
+Wave overhangs are simply one thing that produces slow flow; slow walls, infill, bridges and
+overhang slowdowns count too. Track cumulative time spent extruding at or below a slow-flow
+threshold. When that accumulated time exceeds a safe limit:
 
 1. Interrupt the profile extrusion.
-2. Z-hop and travel the head to a configurable flush position (off-part).
+2. Z-hop and travel the head to the printer's designated flush position (the X1C poop-chute,
+   off-bed) — never onto the bed.
 3. Purge a configurable volume at a fast flow rate to eject the over-soaked filament.
-4. Optionally wipe.
-5. Return and resume printing.
+4. Optionally wipe on the machine wiper at that position.
+5. Return and resume printing, restoring machine state exactly.
 6. Reset the slow-flow accumulator.
 
 **Scheduling:** prefer to place each flush at the next layer change, or at an existing
@@ -59,7 +63,6 @@ this fork (names have likely drifted from upstream) and build on:
 | Travel head to a designated position / at layer change | timelapse feature (parks toolhead) |
 | Purge a set volume + wipe | filament-change / wipe-tower / prime-tower logic |
 | Splice sequences into the stream | layer-change and custom-G-code injection hooks |
-| Scope to slow regions | this fork's `; WAVE_OVERHANG_START` / `; WAVE_OVERHANG_END` markers |
 
 For the flush move, reuse existing `travel_speed`, retraction (`retract_length`,
 `retract_speed`, `deretract_speed`) and `z_hop` config rather than adding duplicates.
@@ -86,19 +89,17 @@ dumps the full config, so it gains the new `; thermal_dwell_* = <default>` lines
 metadata, not behaviour; a diff of an off-guard slice vs stock must contain *only* those lines and
 no toolpath changes.) Types are Slic3r `ConfigOption` kinds. `sidetext` = the Unit column.
 
-### Group 1 — Enable & scope
+### Group 1 — Enable
 
 | Key | Type | Default | Unit | Purpose |
 |---|---|---|---|---|
 | `thermal_dwell_guard_enable` | coBool | `false` | — | Master switch. Off = stock behaviour. |
-| `thermal_dwell_scope` | coEnum `ThermalDwellScope` | `WaveOverhangOnly` | — | Where active. v1 scopes via `; WAVE_OVERHANG_START` / `; WAVE_OVERHANG_END` markers; `WholePrint` later. |
 
-**Marker coupling (Stage 1).** Those markers are emitted per *ExtrusionPath* by `GCode::_extrude`,
-and were originally gated on `wave_overhang_debug_gcode`. Since `WaveOverhangOnly` makes them a
-*functional input* rather than debug output, `_extrude` now also emits them whenever the guard is
-enabled with that scope. With the guard off the condition reduces to the original one, so
-guard-off output stays byte-identical. Consequence: `wave_overhang_debug_gcode = false` no longer
-guarantees a marker-free file when the guard is on.
+**Standalone (Stage 2).** The `thermal_dwell_scope` option and the `ThermalDwellScope` enum were
+**removed** in Stage 2 — the guard always monitors the whole print by flow rate, with no
+dependency on wave-overhang markers. `GCode::_extrude` reverted its marker emission to being
+gated solely on `wave_overhang_debug_gcode` (a pure debug aid again). The module is portable to
+stock OrcaSlicer.
 
 ### Group 2 — Trigger (thermal model)
 
@@ -115,25 +116,24 @@ guarantees a marker-free file when the guard is on.
 | Key | Type | Default | Unit | Purpose |
 |---|---|---|---|---|
 | `thermal_dwell_flush_z_lift` | coFloat | `1.0` | mm | Z-hop before/along travel and during purge, so the nozzle clears the part. |
+| `thermal_dwell_flush_position` | coPoint | `70, 265` | mm | Machine flush/wipe XY. Default = the Bambu X1C poop-chute. |
 | `thermal_dwell_purge_volume` | coFloat | `25` | mm³ | Filament ejected to clear over-soaked material. ≈1.5–2× melt-zone volume. |
 | `thermal_dwell_purge_flow` | coFloat | `12` | mm³/s | Purge flow — deliberately fast, to force the hot filament exchange. |
-| `thermal_dwell_wipe` | coBool | `true` | — | Wipe the nozzle after purging before returning; the wipe sequence is reused from the printer (see below), not synthesised. |
+| `thermal_dwell_wipe` | coBool | `true` | — | Wipe on the machine wiper at the flush position; the built-in X1C wiper pattern (motion only) is replicated, not synthesised from filament-change G-code. |
 
-**Flush position + wipe are NOT config options — they are derived from the selected printer.**
-(Changed from an earlier `thermal_dwell_flush_position` coPoint: a static point cannot track custom
-printer setups.) At flush time the guard resolves the park position and wipe sequence from the
-printer, in order:
-
-1. the printer's `change_filament_gcode` (for the X1C this is the AMS macro that parks at the
-   poop-chute, ≈ `X70 / Y265`, and wipes),
-2. else the printer's `machine_start_gcode`,
-3. else a hard-coded fallback = **X1C default park `X70 / Y265`**
-   (`THERMAL_DWELL_FALLBACK_FLUSH_POS` in `src/libslic3r/GCode/ThermalDwellGuard.hpp`).
+**Flush position + wiper pattern (Stage 2 — reversed from the Stage-0/1 note).** Rather than
+parse the user's machine G-code at slice time (arbitrary templates have no reliable anchor), the
+X1C chute XY and wiper sweep were **extracted at development time** from the bundled profile
+`resources/profiles/BBL/machine/Bambu Lab X1 Carbon 0.4 nozzle.json` (`change_filament_gcode`:
+`G1 X70 …` / `G1 Y245 → Y265`) and baked as the default of `thermal_dwell_flush_position` and a
+built-in wiper pattern. The fallback constant `THERMAL_DWELL_FALLBACK_FLUSH_POS` in
+`src/libslic3r/GCode/ThermalDwellGuard.hpp` mirrors the same XY.
 
 **Do not invoke `change_filament_gcode` wholesale.** On Bambu it is a full AMS *cut + reload* macro
-(`M620.x`); the guard must reuse only its **park position + wipe**, then perform its own
-same-material purge of `purge_volume` at `purge_flow`. v1 targets the X1C; other printers derive
-from their own equivalents later.
+(`M620.x`) with temperature ramps — minutes of destructive state change. The guard replicates only
+the **motion subset** (travel to chute → purge → wiper drag), generating its own same-material
+purge of `purge_volume` at `purge_flow` so E-accounting stays provably correct. v1 targets the X1C;
+other printers get per-machine templates later.
 
 ### Group 4 — Scheduling
 
@@ -145,7 +145,7 @@ from their own equivalents later.
 ### Enums
 
 ```cpp
-enum class ThermalDwellScope    { WaveOverhangOnly, WholePrint };
+// (ThermalDwellScope was removed in Stage 2 — the guard is standalone / whole-print.)
 enum class ThermalDwellReset    { OnTravel,          // reset on any travel move
                                   OnFastSegment,     // reset after a fast-flow segment (v1 default)
                                   OnVolume };         // reset once fast-extruded volume >= melt_zone_volume (most physical)
@@ -212,16 +212,18 @@ Build and verify each stage before starting the next.
   stage). *Verify:* options appear in the UI; the calibration placeholder appears; with the guard
   disabled, the sliced toolpath is byte-identical to stock — the only diff vs stock is the inert
   `; thermal_dwell_* = <default>` lines added to the embedded `; CONFIG_BLOCK`.
-- **Stage 1 — Detect only.** Accumulate slow-flow time within `; WAVE_OVERHANG_START/END`
-  regions and mark where a flush *would* occur. No injection. **See
-  `docs/thermal_dwell_guard/STAGE1.md`, which governs this stage.** In particular the
-  `;THERMAL_DWELL t=NN` sketch above is superseded by STAGE1 §5's three-form grammar
+- **Stage 1 — Detect only.** Accumulate slow-flow time (Stage 1 scoped this to
+  `; WAVE_OVERHANG_START/END` regions; Stage 2 removed that scope) and mark where a flush *would*
+  occur. No injection. **See `docs/thermal_dwell_guard/STAGE1.md`, which governs this stage.** In
+  particular the `;THERMAL_DWELL t=NN` sketch above is superseded by STAGE1 §5's three-form grammar
   (`;THERMAL_DWELL_CONFIG` echo, `;THERMAL_DWELL_FLUSH_POINT` lines, `;THERMAL_DWELL_SUMMARY`
   block). *Verify:* STAGE1 §7's acceptance checklist — comments land at sane spots and survive an
   independent recomputation by `scripts/check_thermal_dwell.py`.
-- **Stage 2 — Forced flush injection.** At threshold: retract → z-hop → travel to flush pos
-  → purge at purge flow → optional wipe → return → resume, then reset accumulator. *Verify:*
-  sequences correct in preview and raw G-code.
+- **Stage 2 — Standalone module + chute flush injection.** Part A drops the scope option so the
+  guard is standalone (whole-print, flow-only, no wave dependency). Part B, at threshold: retract →
+  z-hop → travel to the machine flush position (X1C chute) → purge at purge flow → optional wiper
+  drag → return → restore state → resume, then reset the accumulator. **See
+  `docs/thermal_dwell_guard/STAGE2.md`, which governs this stage.** *Verify:* STAGE2 §10.
 - **Stage 3 — Smart scheduling.** Add look-ahead so flushes snap to the next layer change or
   existing travel within `thermal_dwell_lookahead`; force a mid-print break only when no
   natural break is available in time. *Verify:* flushes migrate to breaks when possible.
@@ -231,23 +233,18 @@ Build and verify each stage before starting the next.
 
 ## 9. Verification without printing
 
-The fork emits wave-overhang marker comments in the G-code. Confirmed in source
-(`GCode::_extrude`): they are **`; WAVE_OVERHANG_START`** and **`; WAVE_OVERHANG_END`** — note the
-space after the semicolon, which several older docs get wrong. A separate `;_WAVE_OVERHANG_FAN_*`
-family (leading underscore, no space) is consumed and stripped by `CoolingBuffer` and is not
-usable for scoping.
-
-To check any stage: slice a small overhang test model, then diff toolpath/G-code before vs
-after, and inspect the `;THERMAL_DWELL_*` / flush sequences. This closes the loop in seconds
-rather than test prints. Only move to filament once G-code inspection passes.
+To check any stage: slice a small test model, then diff toolpath/G-code before vs after, and
+inspect the `;THERMAL_DWELL_*` markers and flush sequences. This closes the loop in seconds rather
+than test prints. Only move to filament once G-code inspection passes.
 `scripts/gen_overhang_test_model.py` generates a suitable cantilever test model, and
-`scripts/check_thermal_dwell.py` verifies the Stage 1 markers independently.
+`scripts/check_thermal_dwell.py` verifies the markers and (Stage 2) the inserted flush blocks
+independently. (The fork still emits `; WAVE_OVERHANG_START/END` debug markers — space after the
+semicolon — but the guard no longer reads them; they are a pure `wave_overhang_debug_gcode` aid.)
 
 ## 10. Out of scope (v1)
 
 - Runtime/firmware monitoring of any kind.
-- Deriving the flush position + wipe from the printer's `change_filament_gcode` /
-  `machine_start_gcode` — the mechanism is specified in §6, but v1 wires only the X1C fallback
-  constant; robust parsing/derivation is Stage 2.
+- Per-machine flush templates for non-X1C printers — Stage 2 bakes the X1C chute XY + wiper as
+  defaults; other printers get their own templates later.
 - Per-filament thermal options (flagged as a TODO, migrated in a later pass).
-- Non-wave regions (`WholePrint` scope) — schema-ready, enabled later.
+- Scheduling/look-ahead (`schedule_mode`, `lookahead`) — schema-ready, live from Stage 3.

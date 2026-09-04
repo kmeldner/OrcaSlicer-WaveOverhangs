@@ -1,10 +1,17 @@
 # Thermal Dwell Guard — Stage 1 Specification: Detection Pass
 
-**Status:** ready to implement (Stage 0 complete)
+**Status:** implemented; **partially superseded by Stage 2** (see banner).
 **Placement:** `docs/thermal_dwell_guard/STAGE1.md`
 **Relationship to SPEC.md:** refines SPEC §8 "Stage 1". Where details differ (e.g. the
 marker grammar below supersedes SPEC's `;THERMAL_DWELL t=NN` sketch), THIS file governs —
 and SPEC.md §8 must be touched up to match in the same commit.
+
+> **⚠ Superseded by Stage 2 (`STAGE2.md`).** Stage 2 made the guard **standalone**: the
+> `thermal_dwell_scope` option and `ThermalDwellScope` enum are **gone**, `in_wave_region`
+> tracking and all wave-marker parsing were **removed**, and slow extrusion **always**
+> accumulates (STAGE1 §4 rows 1 and 2 merged). The `;THERMAL_DWELL_CONFIG` echo dropped `scope=`
+> and gained the Group-3 flush values; the checker's wave-region containment check was removed
+> and replaced by per-flush-block validation. Read the scope-specific parts below as historical.
 
 ---
 
@@ -112,6 +119,7 @@ Config: `q_slow = thermal_dwell_flow_threshold`, `q_fast = thermal_dwell_fast_fl
 `T_max = thermal_dwell_max_time`, `V_melt = thermal_dwell_melt_zone_volume`.
 
 "In scope" = (`scope == WholePrint`) OR (`scope == WaveOverhangOnly` AND `in_wave_region`).
+**(Stage 2: scope removed — everything is in scope, so rows 1 and 2 below merge into one.)**
 
 Per move (duration `d`, volume `v`, flow `q = v/d` for extrusion moves):
 
@@ -169,8 +177,8 @@ and `;LAYER_CHANGE` (no space), and `; CHANGE_LAYER` (space, BBL). The no-space 
 form below is therefore a deliberate choice and is **final**; the checker script matches it
 exactly. Canonical forms:
 
-- **Config echo** — once, adjacent to the fork's `;WAVE_OVERHANG_CONFIG` echo or in the
-  same header/footer area:
+- **Config echo** — once, in the header/footer area. **(Stage 2 dropped `scope=` and appended
+  the Group-3 flush values — see STAGE2 §7 for the current form.)** Stage-1 form:
 
   `;THERMAL_DWELL_CONFIG scope=<WaveOverhangOnly|WholePrint> flow_max=<f> fast_min=<f> max_time=<f> reset=<OnTravel|OnFastSegment|OnVolume> melt_zone=<f>`
 

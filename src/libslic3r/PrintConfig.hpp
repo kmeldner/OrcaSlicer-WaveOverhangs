@@ -87,11 +87,8 @@ enum class WaveOverhangPattern : int {
     Smart
 };
 
-// Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6).
-enum class ThermalDwellScope : int {
-    WaveOverhangOnly,   // active only inside "; WAVE_OVERHANG_START/END" regions (v1 default)
-    WholePrint          // active for the whole print (enabled later)
-};
+// Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6). Standalone as of Stage 2:
+// it monitors the whole print by flow rate alone and no longer has a scope enum.
 enum class ThermalDwellReset : int {
     OnTravel,           // reset on any travel move
     OnFastSegment,      // reset after a fast-flow segment (v1 default)
@@ -560,7 +557,6 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WaveOverhangSpacingMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WaveOverhangSeamMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WaveOverhangPattern)
-CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ThermalDwellScope)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ThermalDwellReset)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ThermalDwellSchedule)
 
@@ -1197,13 +1193,13 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Thermal dwell guard (see docs/thermal_dwell_guard/SPEC.md §6). Inert while
     // thermal_dwell_guard_enable is false; runtime behaviour lands in later stages.
     ((ConfigOptionBool,                        thermal_dwell_guard_enable))
-    ((ConfigOptionEnum<ThermalDwellScope>,     thermal_dwell_scope))
     ((ConfigOptionFloat,                       thermal_dwell_flow_threshold))
     ((ConfigOptionFloat,                       thermal_dwell_max_time))
     ((ConfigOptionFloat,                       thermal_dwell_fast_flow_threshold))
     ((ConfigOptionEnum<ThermalDwellReset>,     thermal_dwell_reset_mode))
     ((ConfigOptionFloat,                       thermal_dwell_melt_zone_volume))
     ((ConfigOptionFloat,                       thermal_dwell_flush_z_lift))
+    ((ConfigOptionPoint,                       thermal_dwell_flush_position))
     ((ConfigOptionFloat,                       thermal_dwell_purge_volume))
     ((ConfigOptionFloat,                       thermal_dwell_purge_flow))
     ((ConfigOptionBool,                        thermal_dwell_wipe))

@@ -14,23 +14,19 @@
 namespace Slic3r {
 namespace ThermalDwell {
 
-// Mirrors of PrintConfig.hpp's ThermalDwellScope / ThermalDwellReset. Duplicated on purpose:
-// it is what keeps this translation unit free of the config headers. ThermalDwellGuard::
-// resolve_config() owns the translation and is the only place the two may drift.
-enum class Scope : int {
-    WaveOverhangOnly, // accumulate only inside "; WAVE_OVERHANG_START/END" regions (v1 default)
-    WholePrint        // accumulate everywhere
-};
-
+// Mirror of PrintConfig.hpp's ThermalDwellReset. Duplicated on purpose: it is what keeps this
+// translation unit free of the config headers. ThermalDwellGuard::resolve_config() owns the
+// translation and is the only place the two may drift.
 enum class Reset : int {
     OnTravel,      // any non-extruding move resets
     OnFastSegment, // a single fast-flow segment resets (v1 default)
     OnVolume       // reset once fast-extruded volume >= melt zone volume (most physical)
 };
 
+// Standalone as of Stage 2: no `scope` field. The guard watches the whole print by flow rate
+// alone, so slow extrusion always accumulates — there is no wave-region gating any more.
 struct Config
 {
-    Scope scope{ Scope::WaveOverhangOnly };
     Reset reset{ Reset::OnFastSegment };
     float q_slow{ 2.0f };   // thermal_dwell_flow_threshold      [mm^3/s]
     float q_fast{ 5.0f };   // thermal_dwell_fast_flow_threshold [mm^3/s]
@@ -44,12 +40,16 @@ struct Config
 // `duration` must be the move's OWN accel-aware time. It must never carry a dwell that
 // happened around the move — see ThermalDwellGuard's additional_time handling, which feeds
 // such dwells as their own synthetic moves instead.
+//
+// `excluded` marks a move that lies inside an exclusion zone (toolchange / wipe-tower /
+// filament-change / custom-gcode block, STAGE2 §6). Accumulation continues across it, but a
+// flush may not be ANCHORED on it: a crossing there is deferred to the first non-excluded move.
 struct Move
 {
     bool  is_extrusion{ false };
     float duration{ 0.0f };      // s
     float volume{ 0.0f };        // mm^3 of filament; 0 unless is_extrusion
-    bool  in_wave_region{ false };
+    bool  excluded{ false };
 };
 
 struct FlushEvent
@@ -80,13 +80,15 @@ public:
     float total_slow_flow_seconds() const { return m_total_slow_flow_s; }
 
 private:
-    bool in_scope(const Move &move) const
-        { return m_cfg.scope == Scope::WholePrint || move.in_wave_region; }
-    std::optional<FlushEvent> check_threshold();
+    // `excluded` = the current move sits in an exclusion zone, so a crossing here may not be
+    // anchored on it. When that happens the crossing is remembered (m_flush_pending) and fired
+    // on the first subsequent non-excluded move instead (STAGE2 §6 deferral).
+    std::optional<FlushEvent> check_threshold(bool excluded);
 
     Config m_cfg;
     float  m_acc{ 0.0f };       // s, >= 0
     float  m_fast_vol{ 0.0f };  // mm^3, used only by Reset::OnVolume
+    bool   m_flush_pending{ false }; // a crossing landed in an exclusion zone, awaiting a safe line
     unsigned int m_flush_count{ 0 };
     float  m_total_slow_flow_s{ 0.0f };
 };

@@ -116,6 +116,12 @@ ctest --test-dir ./tests/sla_print/sla_print_tests
 - **Adaptive Slicing**: Variable layer height based on geometry
 - **Multi-material**: Multi-extruder and soluble support processing
 - **G-code Post-processing**: Cooling, fan control, pressure advance, conflict checking
+- **Thermal Dwell Guard**: A **standalone** G-code post-processing pass
+  (`src/libslic3r/GCode/ThermalDwell*.{cpp,hpp}`, driven from `GCodeProcessor`) that accumulates
+  "slow-flow seconds" from each move's volumetric flow across the whole print and pre-injects
+  filament flushes at the printer's designated flush position (Bambu X1C poop-chute) to prevent
+  heat-creep jams. It depends on no wave-overhang code and is portable to stock OrcaSlicer. See
+  `docs/thermal_dwell_guard/` (SPEC + staged specs); verify with `scripts/check_thermal_dwell.py`.
 
 ### File Format Support
 - **3MF/BBS_3MF**: Native format with extensions for multi-material and metadata

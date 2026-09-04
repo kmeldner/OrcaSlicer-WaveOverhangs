@@ -110,14 +110,6 @@ const std::string GCodeProcessor::VFlush_End_Tag  = " VFLUSH_END";
 //Orca: External device purge tag
 const std::string GCodeProcessor::External_Purge_Tag = " EXTERNAL_PURGE";
 
-// Orca: wave-overhang region markers, emitted by GCode::_extrude(). The leading space is
-// required — the emitted line is "; WAVE_OVERHANG_START" and process_gcode_line() strips only
-// the ';'. Matched in full because "; WAVE_OVERHANG_BUILD" and "; WAVE_OVERHANG_CONFIG" share
-// the prefix. (The ";_WAVE_OVERHANG_FAN_*" family is a different convention entirely — no
-// space, leading underscore — and is consumed and stripped by CoolingBuffer.)
-const std::string GCodeProcessor::Wave_Overhang_Start_Tag = " WAVE_OVERHANG_START";
-const std::string GCodeProcessor::Wave_Overhang_End_Tag = " WAVE_OVERHANG_END";
-
 const float GCodeProcessor::Wipe_Width = 0.05f;
 const float GCodeProcessor::Wipe_Height = 0.05f;
 
@@ -446,8 +438,12 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
         //    and mis-file a fast move as slow. That dwell is fed separately below.
         if (guard != nullptr && mode == PrintEstimatedStatistics::ETimeMode::Normal)
             guard->on_move(block.move_type == EMoveType::Extrude, move_time,
-                           block.thermal_dwell_volume, block.thermal_dwell_in_wave,
-                           block.g1_line_id, block.layer_id, block.thermal_dwell_z);
+                           block.thermal_dwell_volume, block.thermal_dwell_excluded,
+                           block.g1_line_id, block.layer_id,
+                           block.thermal_dwell_x, block.thermal_dwell_y, block.thermal_dwell_z,
+                           block.thermal_dwell_e, block.thermal_dwell_e_relative,
+                           block.thermal_dwell_retracted, block.thermal_dwell_feedrate,
+                           block.thermal_dwell_tool);
 
         //BBS
         if (block.flags.prepare_stage)
@@ -568,8 +564,12 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
     if (guard != nullptr && mode == PrintEstimatedStatistics::ETimeMode::Normal &&
         additional_time > 0.0f && n_blocks_process > 0) {
         const TimeBlock& last = blocks[n_blocks_process - 1];
-        guard->on_move(false, additional_time, 0.0f, last.thermal_dwell_in_wave,
-                       last.g1_line_id, last.layer_id, last.thermal_dwell_z);
+        guard->on_move(false, additional_time, 0.0f, last.thermal_dwell_excluded,
+                       last.g1_line_id, last.layer_id,
+                       last.thermal_dwell_x, last.thermal_dwell_y, last.thermal_dwell_z,
+                       last.thermal_dwell_e, last.thermal_dwell_e_relative,
+                       last.thermal_dwell_retracted, last.thermal_dwell_feedrate,
+                       last.thermal_dwell_tool);
     }
 
     if (keep_last_n_blocks) {
@@ -1209,18 +1209,17 @@ void GCodeProcessor::run_post_process()
         td_anchor_end = m_thermal_dwell_guard->anchors().end();
     }
 
-    // Orca: thermal dwell guard — emit ";THERMAL_DWELL_FLUSH_POINT" after the move that
-    // crossed the limit. Takes the id of the LAST block belonging to the line just appended
-    // and drains every anchor at or below it, so nothing is dropped: G2/G3 collapse several
-    // blocks onto a single line, and G10/G11 re-use the preceding line's id.
-    auto process_line_thermal_dwell = [&td_anchor_it, &td_anchor_end, &export_line](const size_t last_block_id_on_line) {
+    // Orca: thermal dwell guard — Stage 2. After the move that crossed the limit, splice in the
+    // full flush block: the kept ;THERMAL_DWELL_FLUSH_POINT line, then the ;..._FLUSH_START/END
+    // §5 sequence. Takes the id of the LAST block belonging to the line just appended and drains
+    // every anchor at or below it, so nothing is dropped: G2/G3 collapse several blocks onto a
+    // single line, and G10/G11 re-use the preceding line's id.
+    auto process_line_thermal_dwell = [this, &td_anchor_it, &td_anchor_end, &export_line](const size_t last_block_id_on_line) {
         while (td_anchor_it != td_anchor_end && td_anchor_it->g1_line_id <= last_block_id_on_line) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_POINT id=%u acc=%.2fs layer=%u z=%.3f\n",
-                     td_anchor_it->id, td_anchor_it->acc, td_anchor_it->layer, td_anchor_it->z);
-            // ignore_from_move = true, or this line steals the original->final line mapping
-            // slot and synchronize_moves() mis-maps MoveVertex::gcode_id.
-            export_line.append_line(buf, true);
+            // ignore_from_move = true on every inserted line, or they steal the original->final
+            // line-mapping slots and synchronize_moves() mis-maps MoveVertex::gcode_id.
+            for (const std::string& line : m_thermal_dwell_guard->format_flush_lines(*td_anchor_it))
+                export_line.append_line(line, true);
             ++td_anchor_it;
         }
     };
@@ -1467,18 +1466,19 @@ void GCodeProcessor::run_post_process()
         }
     }
 
-    // Orca: thermal dwell guard summary (STAGE1 §5). Must precede flush(): append_line() only
-    // pushes into ExportLines' write-behind cache, and flush() is what drains the remainder to
-    // the file. ignore_from_move = true for the same reason as the inline markers.
+    // Orca: thermal dwell guard summary (STAGE2 §7 — now with totals). Must precede flush():
+    // append_line() only pushes into ExportLines' write-behind cache, and flush() is what drains
+    // the remainder to the file. ignore_from_move = true for the same reason as the inline
+    // markers. format_summary() returns the whole multi-line block; split on newlines so each
+    // physical line is appended (and mapping-ignored) individually.
     if (m_thermal_dwell_guard != nullptr) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), ";THERMAL_DWELL_SUMMARY count=%zu\n",
-                 m_thermal_dwell_guard->anchors().size());
-        export_line.append_line(buf, true);
-        for (const ThermalDwellGuard::FlushAnchor& anchor : m_thermal_dwell_guard->anchors()) {
-            snprintf(buf, sizeof(buf), ";THERMAL_DWELL_POINT id=%u layer=%u z=%.3f acc=%.2f\n",
-                     anchor.id, anchor.layer, anchor.z, anchor.acc);
-            export_line.append_line(buf, true);
+        const std::string summary = m_thermal_dwell_guard->format_summary();
+        size_t pos = 0;
+        while (pos < summary.size()) {
+            const size_t nl = summary.find('\n', pos);
+            const size_t end = (nl == std::string::npos) ? summary.size() : nl + 1;
+            export_line.append_line(summary.substr(pos, end - pos), true);
+            pos = end;
         }
     }
 
@@ -2020,15 +2020,16 @@ void GCodeProcessor::set_print(Print* print)
 {
     m_print = print;
 
-    // Orca: thermal dwell guard (Stage 1). Built only when some print region enables it;
-    // otherwise the pointer stays null and every Stage 1 branch is dead, which is what makes
-    // guard-off output byte-identical to stock by construction rather than by testing.
-    // resolve_config() is shared with GCode.cpp's ;THERMAL_DWELL_CONFIG echo, so the echo and
-    // the behaviour can never disagree.
+    // Orca: thermal dwell guard. Built only when some print region enables it; otherwise the
+    // pointer stays null and every guard branch is dead, which is what makes guard-off output
+    // byte-identical to stock by construction rather than by testing. resolve_config() is shared
+    // with GCode.cpp's ;THERMAL_DWELL_CONFIG echo, so the echo and the behaviour can never
+    // disagree; the flush params come from the same first guard-enabled region.
     m_thermal_dwell_guard.reset();
     if (print != nullptr) {
         if (const std::optional<ThermalDwell::Config> cfg = ThermalDwellGuard::resolve_config(*print))
-            m_thermal_dwell_guard = std::make_unique<ThermalDwellGuard>(*cfg);
+            m_thermal_dwell_guard = std::make_unique<ThermalDwellGuard>(
+                *cfg, ThermalDwellGuard::resolve_flush_params(*print));
     }
 }
 
@@ -2556,9 +2557,9 @@ void GCodeProcessor::reset()
     m_processing_start_custom_gcode = false;
     m_g1_line_id = 0;
     m_layer_id = 0;
-    // Orca: thermal dwell guard scope. The guard itself is (re)built in set_print(), which
-    // always runs after construction, so it is deliberately not touched here.
-    m_in_wave_overhang = false;
+    // Orca: thermal dwell guard — running retract state. The guard itself is (re)built in
+    // set_print(), which always runs after construction, so it is deliberately not touched here.
+    m_retracted = false;
     m_cp_color.reset();
 
     m_producer = EProducer::Unknown;
@@ -3185,19 +3186,8 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         return;
     }
 
-    // Orca: wave-overhang region scope for the thermal dwell guard. Emitted per
-    // ExtrusionPath, so these repeat many times across one visual overhang region — the flag
-    // is a level, not a latch. Matched before the shorter tags below so that neither
-    // "; WAVE_OVERHANG_BUILD" nor "; WAVE_OVERHANG_CONFIG" can be mistaken for a region edge.
-    if (boost::starts_with(comment, GCodeProcessor::Wave_Overhang_Start_Tag)) {
-        m_in_wave_overhang = true;
-        return;
-    }
-
-    if (boost::starts_with(comment, GCodeProcessor::Wave_Overhang_End_Tag)) {
-        m_in_wave_overhang = false;
-        return;
-    }
+    // (Stage 2: the thermal dwell guard is standalone and no longer parses the wave-overhang
+    // region markers; those remain a pure debug-gcode feature of the wave generator.)
 
     //BBS: flush start tag
     if (boost::starts_with(comment, GCodeProcessor::Flush_Start_Tag)) {
@@ -3855,6 +3845,25 @@ void GCodeProcessor::process_G1(const GCodeReader::GCodeLine& line, const std::o
     process_G1(g1_axes, g1_feedrate);
 }
 
+void GCodeProcessor::stamp_thermal_dwell_state(TimeBlock& block) const
+{
+    // STAGE2 §4 state snapshot + §6 exclusion flag, from the live parser state at block build
+    // time (m_end_position is the end of this move — the state downstream original lines see).
+    //
+    // Exclusion zones: wipe-tower (m_wipe_tower), filament flush (m_flushing), and custom-gcode
+    // blocks (erCustom role — start/end gcode, per-layer custom gcode, pause blocks). An anchor
+    // may not land inside one; the accumulator defers it to the first safe line.
+    block.thermal_dwell_excluded   = m_wipe_tower || m_flushing || (m_extrusion_role == erCustom);
+    block.thermal_dwell_x          = float(m_end_position[X]);
+    block.thermal_dwell_y          = float(m_end_position[Y]);
+    block.thermal_dwell_e          = float(m_end_position[E]); // logical E (volumetric E is off)
+    block.thermal_dwell_e_relative = (m_global_positioning_type  == EPositioningType::Relative) ||
+                                     (m_e_local_positioning_type == EPositioningType::Relative);
+    block.thermal_dwell_retracted  = m_retracted;
+    block.thermal_dwell_feedrate   = m_feedrate * 60.0f;       // mm/s -> mm/min
+    block.thermal_dwell_tool       = m_extruder_id;
+}
+
 void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes, const std::optional<double>& feedrate,
     G1DiscretizationOrigin origin, const std::optional<unsigned int>& remaining_internal_g1_lines)
 {
@@ -3925,6 +3934,10 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         return;
 
     EMoveType type = move_type(delta_pos);
+    // Orca: thermal dwell guard — track retract state off the same classification (the anchor
+    // must be able to restore the anchor's exact retract state).
+    if (type == EMoveType::Retract)        m_retracted = true;
+    else if (type == EMoveType::Unretract) m_retracted = false;
     // Orca: thermal dwell guard — extruded volume for this move, stamped onto the time block
     // below. Stays 0 for non-extrude moves; note m_mm3_per_mm and m_travel_dist are only
     // assigned in the Extrude branch and so go stale on travels, which is why this is a fresh
@@ -4046,7 +4059,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         // stamped here instead of read back off m_result.moves when the block resolves.
         block.thermal_dwell_volume = thermal_dwell_move_volume;
         block.thermal_dwell_z = float(m_end_position[Z]);
-        block.thermal_dwell_in_wave = m_in_wave_overhang;
+        stamp_thermal_dwell_state(block);
         block.flags.prepare_stage = m_processing_start_custom_gcode;
 
         //BBS: limite the cruise according to centripetal acceleration
@@ -4345,6 +4358,9 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
         return;
 
     EMoveType type = move_type(delta_pos);
+    // Orca: thermal dwell guard — track retract state off the same classification.
+    if (type == EMoveType::Retract)        m_retracted = true;
+    else if (type == EMoveType::Unretract) m_retracted = false;
     // BBS: now we only support virtual flush
     if (EMoveType::Unretract == type && m_virtual_flushing) {
         int extruder_id = get_extruder_id();
@@ -4411,7 +4427,7 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
         block.thermal_dwell_volume = (type == EMoveType::Extrude)
             ? float(area_filament_cross_section * delta_pos[E]) : 0.0f;
         block.thermal_dwell_z = float(m_end_position[Z]);
-        block.thermal_dwell_in_wave = m_in_wave_overhang;
+        stamp_thermal_dwell_state(block);
         block.flags.prepare_stage = m_processing_start_custom_gcode;
 
         //BBS: limite the cruise according to centripetal acceleration
