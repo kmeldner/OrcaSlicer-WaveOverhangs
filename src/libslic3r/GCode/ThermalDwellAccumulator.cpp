@@ -14,6 +14,13 @@ void Accumulator::reset()
     m_total_slow_flow_s = 0.0f;
 }
 
+void Accumulator::set_episode(float acc, float fast_vol)
+{
+    m_acc           = acc;
+    m_fast_vol      = fast_vol;
+    m_flush_pending = false;
+}
+
 // STAGE1 §4's table, one branch per row. Row numbers below refer to that table. As of Stage 2
 // the guard is standalone, so rows 1 and 2 (in/out of scope) collapse: slow extrusion always
 // accumulates.

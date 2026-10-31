@@ -2526,7 +2526,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // actually ran. Emitted only when the guard is on, so guard-off output is untouched.
     if (const std::optional<ThermalDwell::Config> td_cfg = ThermalDwellGuard::resolve_config(print))
         file.write(ThermalDwellGuard::format_config_comment(
-            *td_cfg, ThermalDwellGuard::resolve_flush_params(print)));
+            *td_cfg, ThermalDwellGuard::resolve_schedule(print),
+            ThermalDwellGuard::resolve_flush_params(print)));
 
     if(!has_BTT_thumbnail){
         file.write_format("; HEADER_BLOCK_START\n");

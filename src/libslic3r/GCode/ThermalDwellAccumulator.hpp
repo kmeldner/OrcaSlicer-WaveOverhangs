@@ -70,6 +70,11 @@ public:
     std::optional<FlushEvent> step(const Move &move);
 
     void reset();
+    // STAGE3 §5 replay: install the episode state of a re-simulated accumulator. Touches only
+    // acc / fast_vol (and clears any pending deferral); flush_count and the slow-flow total are
+    // left alone because the scheduler numbers flushes itself and the seconds were counted
+    // when the moves were first fed.
+    void set_episode(float acc, float fast_vol);
 
     const Config& config() const { return m_cfg; }
     float acc() const { return m_acc; }

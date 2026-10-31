@@ -247,6 +247,8 @@ set(lisbslic3r_sources
     GCode/ThermalDwellAccumulator.hpp
     GCode/ThermalDwellGuard.cpp
     GCode/ThermalDwellGuard.hpp
+    GCode/ThermalDwellScheduler.cpp
+    GCode/ThermalDwellScheduler.hpp
     GCode/ThumbnailData.cpp
     GCode/ThumbnailData.hpp
     GCode/Thumbnails.cpp

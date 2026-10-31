@@ -14,7 +14,7 @@ std::optional<ThermalDwell::Config> ThermalDwellGuard::resolve_config(const Prin
     // PrintRegionConfig (beside the wave-overhang options). So take the settings from the first
     // region that enables the guard.
     //
-    // TODO(Stage 2+): either run a per-region accumulator, or hoist these keys out of
+    // TODO(Stage 4+): either run a per-region accumulator, or hoist these keys out of
     // PrintRegionConfig — the melt zone does not care which region the nozzle is printing.
     for (size_t i = 0; i < print.num_print_regions(); ++i) {
         const PrintRegionConfig &rc = print.get_print_region(i).config();
@@ -34,6 +34,24 @@ std::optional<ThermalDwell::Config> ThermalDwellGuard::resolve_config(const Prin
         return cfg;
     }
     return std::nullopt;
+}
+
+ThermalDwell::ScheduleConfig ThermalDwellGuard::resolve_schedule(const Print &print)
+{
+    ThermalDwell::ScheduleConfig sc;
+    for (size_t i = 0; i < print.num_print_regions(); ++i) {
+        const PrintRegionConfig &rc = print.get_print_region(i).config();
+        if (! rc.thermal_dwell_guard_enable.value)
+            continue;
+        switch (rc.thermal_dwell_schedule_mode.value) {
+        case ThermalDwellSchedule::ForcedOnly:        sc.mode = ThermalDwell::Schedule::ForcedOnly; break;
+        case ThermalDwellSchedule::PreferLayerChange: sc.mode = ThermalDwell::Schedule::PreferLayerChange; break;
+        default:                                      sc.mode = ThermalDwell::Schedule::PreferAnyTravel; break;
+        }
+        sc.lookahead = float(rc.thermal_dwell_lookahead.value);
+        break;
+    }
+    return sc;
 }
 
 ThermalDwellFlushParams ThermalDwellGuard::resolve_flush_params(const Print &print)
@@ -56,7 +74,7 @@ ThermalDwellFlushParams ThermalDwellGuard::resolve_flush_params(const Print &pri
 
     // Reused machine/filament settings. v1 is single-extruder/single-material, so the
     // per-extruder retraction and filament values are taken for tool 0.
-    // TODO(Stage 2+): index by the anchor's active tool once multi-material is in scope.
+    // TODO(Stage 4+): index by the anchor's active tool once multi-material is in scope.
     const PrintConfig &pc = print.config();
     auto at = [](const ConfigOptionFloats &opt, double dflt) -> float {
         return opt.empty() ? float(dflt) : float(opt.get_at(0));
@@ -72,7 +90,26 @@ ThermalDwellFlushParams ThermalDwellGuard::resolve_flush_params(const Print &pri
     return fp;
 }
 
+const char* ThermalDwellGuard::anchor_kind_name(ThermalDwell::AnchorKind kind)
+{
+    switch (kind) {
+    case ThermalDwell::AnchorKind::LayerChange: return "layer_change";
+    case ThermalDwell::AnchorKind::Travel:      return "travel";
+    default:                                    return "forced";
+    }
+}
+
+const char* ThermalDwellGuard::schedule_name(ThermalDwell::Schedule mode)
+{
+    switch (mode) {
+    case ThermalDwell::Schedule::ForcedOnly:        return "forced_only";
+    case ThermalDwell::Schedule::PreferLayerChange: return "prefer_layer_change";
+    default:                                        return "prefer_any_travel";
+    }
+}
+
 std::string ThermalDwellGuard::format_config_comment(const ThermalDwell::Config &cfg,
+                                                     const ThermalDwell::ScheduleConfig &sched,
                                                      const ThermalDwellFlushParams &flush)
 {
     const char *reset = "OnFastSegment";
@@ -85,15 +122,16 @@ std::string ThermalDwellGuard::format_config_comment(const ThermalDwell::Config 
     char buf[512];
     snprintf(buf, sizeof(buf),
              ";THERMAL_DWELL_CONFIG flow_max=%g fast_min=%g max_time=%g reset=%s melt_zone=%g "
-             "flush_pos=%g,%g z_lift=%g purge_vol=%g purge_flow=%g wipe=%d\n",
+             "flush_pos=%g,%g z_lift=%g purge_vol=%g purge_flow=%g wipe=%d sched=%s lookahead=%g\n",
              cfg.q_slow, cfg.q_fast, cfg.t_max, reset, cfg.v_melt,
              flush.flush_pos.x(), flush.flush_pos.y(), flush.z_lift,
-             flush.purge_volume, flush.purge_flow, int(flush.wipe));
+             flush.purge_volume, flush.purge_flow, int(flush.wipe),
+             schedule_name(sched.mode), sched.lookahead);
     return std::string(buf);
 }
 
-void ThermalDwellGuard::on_move(bool is_extrusion, float duration, float volume, bool excluded,
-                                unsigned int g1_line_id, unsigned int layer,
+void ThermalDwellGuard::on_move(bool is_extrusion, bool is_travel, float duration, float volume,
+                                bool excluded, unsigned int g1_line_id, unsigned int layer,
                                 float x, float y, float z, float e, bool e_relative,
                                 bool retracted, float feedrate_mmmin, unsigned int tool)
 {
@@ -103,20 +141,33 @@ void ThermalDwellGuard::on_move(bool is_extrusion, float duration, float volume,
     move.volume       = volume;
     move.excluded     = excluded;
 
-    if (const std::optional<ThermalDwell::FlushEvent> ev = m_acc.step(move)) {
+    ThermalDwell::AnchorState st;
+    st.g1_line_id = g1_line_id;
+    st.layer      = layer;
+    st.z          = z;
+    st.x          = x;
+    st.y          = y;
+    st.e          = e;
+    st.e_relative = e_relative;
+    st.retracted  = retracted;
+    st.feedrate   = feedrate_mmmin;
+    st.tool       = tool;
+
+    for (const ThermalDwell::Scheduled &s : m_sched.step(move, is_travel, st)) {
         FlushAnchor a;
-        a.g1_line_id = g1_line_id;
-        a.id         = ev->id;
-        a.layer      = layer;
-        a.z          = z;
-        a.acc        = ev->acc;
-        a.x          = x;
-        a.y          = y;
-        a.e          = e;
-        a.e_relative = e_relative;
-        a.retracted  = retracted;
-        a.feedrate   = feedrate_mmmin;
-        a.tool       = tool;
+        static_cast<ThermalDwell::AnchorState&>(a) = s.at;
+        a.id    = s.id;
+        a.acc   = s.acc;
+        a.kind  = s.kind;
+        a.early = s.early;
+        // STAGE3 §6: the rewrite's merge-join needs anchors non-decreasing in g1_line_id. The
+        // scheduler guarantees it; if it were ever violated, anchoring here (forced) is the
+        // safe fallback rather than dropping the flush.
+        if (! m_anchors.empty() && a.g1_line_id < m_anchors.back().g1_line_id) {
+            static_cast<ThermalDwell::AnchorState&>(a) = st;
+            a.kind  = ThermalDwell::AnchorKind::Forced;
+            a.early = 0.0f;
+        }
         m_anchors.push_back(a);
     }
 }
@@ -141,7 +192,7 @@ std::vector<std::string> ThermalDwellGuard::format_flush_lines(const FlushAnchor
     const bool  do_r   = r > eps;
 
     std::vector<std::string> lines;
-    char buf[96];
+    char buf[128];
 
     // Running absolute E, only meaningful when !e_relative; the mandatory G92 at the end pins
     // it back to the anchor regardless of any residual.
@@ -161,8 +212,9 @@ std::vector<std::string> ThermalDwellGuard::format_flush_lines(const FlushAnchor
     };
 
     // Kept from Stage 1 (§7): the flush point, then the block markers around the sequence.
-    snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_POINT id=%u acc=%.2fs layer=%u z=%.3f\n",
-             a.id, a.acc, a.layer, a.z);
+    // Stage 3 appends sched= / early= (STAGE3 §7); older parsers stop after z=.
+    snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_POINT id=%u acc=%.2fs layer=%u z=%.3f sched=%s early=%.2fs\n",
+             a.id, a.acc, a.layer, a.z, anchor_kind_name(a.kind), a.early);
     lines.emplace_back(buf);
     snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_START id=%u\n", a.id);
     lines.emplace_back(buf);
@@ -229,23 +281,26 @@ std::string ThermalDwellGuard::format_summary() const
     const float purge_time = (p.purge_flow > 1e-6f) ? p.purge_volume / p.purge_flow : 0.0f;
     const float wipe_time  = p.wipe ? (3.0f * 2.0f * 30.0f) / std::max(1.0f, p.travel_speed) : 0.0f;
     float est_added = 0.0f;
+    size_t scheduled = 0;
     for (const FlushAnchor &a : m_anchors) {
         const float dx = float(p.flush_pos.x()) - a.x;
         const float dy = float(p.flush_pos.y()) - a.y;
         const float d  = std::sqrt(dx * dx + dy * dy);
         const float travel_time = (p.travel_speed > 1e-6f) ? 2.0f * d / p.travel_speed : 0.0f;
         est_added += travel_time + purge_time + wipe_time;
+        if (a.kind != ThermalDwell::AnchorKind::Forced)
+            ++scheduled;
     }
 
     std::string out;
     char buf[192];
     snprintf(buf, sizeof(buf),
-             ";THERMAL_DWELL_SUMMARY count=%zu total_purge_mm3=%.2f est_added_time_s=%.1f\n",
-             count, total_purge, est_added);
+             ";THERMAL_DWELL_SUMMARY count=%zu total_purge_mm3=%.2f est_added_time_s=%.1f scheduled=%zu\n",
+             count, total_purge, est_added, scheduled);
     out += buf;
     for (const FlushAnchor &a : m_anchors) {
-        snprintf(buf, sizeof(buf), ";THERMAL_DWELL_POINT id=%u layer=%u z=%.3f acc=%.2f\n",
-                 a.id, a.layer, a.z, a.acc);
+        snprintf(buf, sizeof(buf), ";THERMAL_DWELL_POINT id=%u layer=%u z=%.3f acc=%.2f sched=%s early=%.2f\n",
+                 a.id, a.layer, a.z, a.acc, anchor_kind_name(a.kind), a.early);
         out += buf;
     }
     return out;

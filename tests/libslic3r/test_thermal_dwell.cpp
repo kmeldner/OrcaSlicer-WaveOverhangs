@@ -2,6 +2,7 @@
 
 #include "libslic3r/GCode/ThermalDwellAccumulator.hpp"
 #include "libslic3r/GCode/ThermalDwellGuard.hpp"
+#include "libslic3r/GCode/ThermalDwellScheduler.hpp"
 
 #include <string>
 #include <vector>
@@ -365,4 +366,236 @@ TEST_CASE("Thermal dwell flush: wipe disabled emits no wiper sweep", "[ThermalDw
 
     REQUIRE_FALSE(any_contains(lines, "Y265.000 F5000"));
     REQUIRE(moves_without_F(lines) == 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3 scheduler (STAGE3 §3–§6). Pure state machine over synthetic moves.
+
+namespace {
+
+using Slic3r::ThermalDwell::Scheduler;
+using Slic3r::ThermalDwell::ScheduleConfig;
+using Slic3r::ThermalDwell::Schedule;
+using Slic3r::ThermalDwell::AnchorKind;
+using Slic3r::ThermalDwell::AnchorState;
+using Slic3r::ThermalDwell::Scheduled;
+
+ScheduleConfig make_sched(Schedule mode, float lookahead = 5.0f)
+{
+    ScheduleConfig s;
+    s.mode = mode;
+    s.lookahead = lookahead;
+    return s;
+}
+
+// Each fed move gets a fresh g1 line id and carries the layer, so anchors are distinguishable.
+struct Feeder
+{
+    Scheduler sched;
+    unsigned int g1{ 0 };
+    unsigned int layer{ 1 };
+    std::vector<Scheduled> fired;
+
+    explicit Feeder(const ScheduleConfig &s) : sched(make_config(), s) {}
+
+    AnchorState state()
+    {
+        AnchorState st;
+        st.g1_line_id = ++g1;
+        st.layer = layer;
+        st.x = float(g1);
+        return st;
+    }
+    void slow(float d = 1.0f)             { fire(sched.step(slow_move(d), false, state())); }
+    void travel(float d = 1.0f, bool excluded = false)
+    {
+        fire(sched.step(travel_move(d, excluded), /*is_travel=*/true, state()));
+    }
+    void retract(float d = 0.1f)          { fire(sched.step(travel_move(d), /*is_travel=*/false, state())); }
+    void fast()                           { fire(sched.step(fast_move(6.0f), false, state())); }
+    void fire(std::vector<Scheduled> v)   { fired.insert(fired.end(), v.begin(), v.end()); }
+};
+
+} // namespace
+
+TEST_CASE("Thermal dwell schedule: ForcedOnly anchors on the crossing move", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::ForcedOnly));
+    for (int i = 0; i < 5; ++i) f.slow();
+    f.travel(); // in window, but ForcedOnly ignores it
+    for (int i = 0; i < 4; ++i) f.slow(); // acc = 5 + 1 (travel extends) + 4 = 10 -> crossing
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::Forced);
+    REQUIRE(f.fired[0].at.g1_line_id == f.g1); // the crossing move itself
+    REQUIRE_THAT(f.fired[0].acc, WithinAbs(10.0f, 1e-5f));
+    REQUIRE_THAT(f.fired[0].early, WithinAbs(0.0f, 1e-5f));
+    REQUIRE_THAT(f.sched.accumulator().acc(), WithinAbs(0.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell schedule: a travel inside the window takes the flush, acc is replayed", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/5.0f));
+    for (int i = 0; i < 5; ++i) f.slow();          // acc 5, t 5
+    f.travel();                                     // acc 6, t 6  <- the break (g1 = 6)
+    const unsigned int travel_g1 = f.g1;
+    for (int i = 0; i < 4; ++i) f.slow();           // acc 10 at t 10 -> crossing, 4 s after the break
+
+    REQUIRE(f.fired.size() == 1);
+    const Scheduled &s = f.fired[0];
+    REQUIRE(s.kind == AnchorKind::Travel);
+    REQUIRE(s.at.g1_line_id == travel_g1);
+    REQUIRE_THAT(s.acc, WithinAbs(6.0f, 1e-5f));   // accumulator value at the break
+    REQUIRE_THAT(s.early, WithinAbs(4.0f, 1e-5f)); // pulled 4 s early, within lookahead 5
+    // Replay: the 4 slow seconds after the break are now the live episode.
+    REQUIRE_THAT(f.sched.accumulator().acc(), WithinAbs(4.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell schedule: a break older than the look-ahead is not used", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/3.0f));
+    for (int i = 0; i < 5; ++i) f.slow();
+    f.travel();                                     // t 6
+    for (int i = 0; i < 4; ++i) f.slow();           // crossing at t 10, 4 s after -> outside 3 s window
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::Forced);
+    REQUIRE_THAT(f.fired[0].early, WithinAbs(0.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell schedule: the latest travel wins", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/10.0f));
+    for (int i = 0; i < 3; ++i) f.slow();
+    f.travel();                                     // older break
+    f.slow(); f.slow();
+    f.travel();                                     // latest break
+    const unsigned int latest = f.g1;
+    for (int i = 0; i < 3; ++i) f.slow();           // acc: 3+1+2+1+3 = 10 -> crossing
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].at.g1_line_id == latest);
+    REQUIRE_THAT(f.fired[0].early, WithinAbs(3.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell schedule: a layer change beats a later travel", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/10.0f));
+    for (int i = 0; i < 3; ++i) f.slow();
+    f.layer = 2;
+    f.travel();                                     // first travel of the new layer = layer_change
+    const unsigned int lc = f.g1;
+    f.slow(); f.slow();
+    f.travel();                                     // plain travel, later
+    for (int i = 0; i < 3; ++i) f.slow();           // crossing
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::LayerChange);
+    REQUIRE(f.fired[0].at.g1_line_id == lc);
+    REQUIRE(f.fired[0].at.layer == 2);
+}
+
+TEST_CASE("Thermal dwell schedule: only the FIRST travel of a new layer is a layer change", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferLayerChange, /*lookahead=*/10.0f));
+    for (int i = 0; i < 3; ++i) f.slow();
+    f.layer = 2;
+    f.travel();                                     // layer_change
+    const unsigned int lc = f.g1;
+    f.slow();                                       // the layer has started extruding
+    f.travel();                                     // just a travel now
+    for (int i = 0; i < 4; ++i) f.slow();           // acc 3+1+1+1+4 = 10 -> crossing
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::LayerChange);
+    REQUIRE(f.fired[0].at.g1_line_id == lc);
+}
+
+TEST_CASE("Thermal dwell schedule: PreferLayerChange ignores plain travels", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferLayerChange, /*lookahead=*/10.0f));
+    for (int i = 0; i < 5; ++i) f.slow();
+    f.travel();
+    for (int i = 0; i < 4; ++i) f.slow();
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::Forced);
+}
+
+TEST_CASE("Thermal dwell schedule: excluded travels and retract-only moves are never breaks", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/10.0f));
+    for (int i = 0; i < 5; ++i) f.slow();
+    f.travel(1.0f, /*excluded=*/true);              // inside a custom-gcode block
+    f.retract();                                    // non-travel non-extruding move
+    for (int i = 0; i < 4; ++i) f.slow();
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::Forced);
+}
+
+TEST_CASE("Thermal dwell schedule: a break before the episode started is not a candidate", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/100.0f));
+    f.slow(); f.slow();
+    f.fast();                                       // reset: episode over
+    f.travel();                                     // acc == 0 here: cannot be pulled into
+    for (int i = 0; i < 10; ++i) f.slow();          // new episode crosses at 10
+
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE(f.fired[0].kind == AnchorKind::Forced);
+}
+
+TEST_CASE("Thermal dwell schedule: ids stay consecutive across scheduled and forced flushes", "[ThermalDwell]")
+{
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/5.0f));
+    for (int i = 0; i < 5; ++i) f.slow();
+    f.travel();
+    for (int i = 0; i < 4; ++i) f.slow();           // #1 scheduled on the travel, replay acc = 4
+    for (int i = 0; i < 6; ++i) f.slow();           // #2 forced at acc 10 (no break in window)
+
+    REQUIRE(f.fired.size() == 2);
+    REQUIRE(f.fired[0].id == 1);
+    REQUIRE(f.fired[1].id == 2);
+    REQUIRE(f.fired[0].kind == AnchorKind::Travel);
+    REQUIRE(f.fired[1].kind == AnchorKind::Forced);
+    REQUIRE(f.fired[0].at.g1_line_id < f.fired[1].at.g1_line_id);
+    REQUIRE(f.sched.flush_count() == 2);
+}
+
+TEST_CASE("Thermal dwell schedule: a replay re-crossing yields a second, forced flush", "[ThermalDwell]")
+{
+    // lookahead >= t_max is the only way the tail after the break can itself exceed t_max.
+    Feeder f(make_sched(Schedule::PreferAnyTravel, /*lookahead=*/100.0f));
+    f.slow();
+    f.travel();                                     // break at t 2, acc 2
+    for (int i = 0; i < 8; ++i) f.slow();           // crossing at acc 10 (t 10): scheduled on the travel
+    // replay of the 8 slow seconds after the break: acc 8, no re-crossing
+    REQUIRE(f.fired.size() == 1);
+    REQUIRE_THAT(f.sched.accumulator().acc(), WithinAbs(8.0f, 1e-5f));
+
+    f.slow(); f.slow();                             // 10 -> second crossing, forced (no break since)
+    REQUIRE(f.fired.size() == 2);
+    REQUIRE(f.fired[1].kind == AnchorKind::Forced);
+}
+
+TEST_CASE("Thermal dwell guard: scheduled anchors carry sched/early in the markers", "[ThermalDwell]")
+{
+    ThermalDwellGuard guard(make_config(), make_sched(Schedule::PreferAnyTravel, 5.0f), make_flush_params());
+    unsigned int g1 = 0;
+    auto feed = [&](bool extrude, bool travel, float dur, float vol) {
+        // X advances per move: a break must actually displace in XY (a pure-Z hop is not one).
+        guard.on_move(extrude, travel, dur, vol, false, ++g1, 3, 10.0f + float(g1), 20.0f, 1.0f, 0.0f, true, false, 1200.0f, 0);
+    };
+    for (int i = 0; i < 5; ++i) feed(true, false, 1.0f, 1.0f);
+    feed(false, true, 1.0f, 0.0f);
+    for (int i = 0; i < 4; ++i) feed(true, false, 1.0f, 1.0f);
+
+    REQUIRE(guard.anchors().size() == 1);
+    const auto &a = guard.anchors()[0];
+    REQUIRE(a.kind == AnchorKind::Travel);
+    REQUIRE(a.g1_line_id == 6);
+    const auto lines = guard.format_flush_lines(a);
+    REQUIRE_THAT(lines.front(), ContainsSubstring("sched=travel early=4.00s"));
+    REQUIRE_THAT(guard.format_summary(), ContainsSubstring("scheduled=1"));
 }

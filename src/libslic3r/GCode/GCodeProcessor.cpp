@@ -437,7 +437,8 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
         //    additional_time into block 0, which would corrupt the flow q = volume/duration
         //    and mis-file a fast move as slow. That dwell is fed separately below.
         if (guard != nullptr && mode == PrintEstimatedStatistics::ETimeMode::Normal)
-            guard->on_move(block.move_type == EMoveType::Extrude, move_time,
+            guard->on_move(block.move_type == EMoveType::Extrude,
+                           block.move_type == EMoveType::Travel, move_time,
                            block.thermal_dwell_volume, block.thermal_dwell_excluded,
                            block.g1_line_id, block.layer_id,
                            block.thermal_dwell_x, block.thermal_dwell_y, block.thermal_dwell_z,
@@ -564,7 +565,7 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
     if (guard != nullptr && mode == PrintEstimatedStatistics::ETimeMode::Normal &&
         additional_time > 0.0f && n_blocks_process > 0) {
         const TimeBlock& last = blocks[n_blocks_process - 1];
-        guard->on_move(false, additional_time, 0.0f, last.thermal_dwell_excluded,
+        guard->on_move(false, false, additional_time, 0.0f, last.thermal_dwell_excluded,
                        last.g1_line_id, last.layer_id,
                        last.thermal_dwell_x, last.thermal_dwell_y, last.thermal_dwell_z,
                        last.thermal_dwell_e, last.thermal_dwell_e_relative,
@@ -2029,7 +2030,8 @@ void GCodeProcessor::set_print(Print* print)
     if (print != nullptr) {
         if (const std::optional<ThermalDwell::Config> cfg = ThermalDwellGuard::resolve_config(*print))
             m_thermal_dwell_guard = std::make_unique<ThermalDwellGuard>(
-                *cfg, ThermalDwellGuard::resolve_flush_params(*print));
+                *cfg, ThermalDwellGuard::resolve_schedule(*print),
+                ThermalDwellGuard::resolve_flush_params(*print));
     }
 }
 

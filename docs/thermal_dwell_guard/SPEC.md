@@ -139,7 +139,7 @@ other printers get per-machine templates later.
 
 | Key | Type | Default | Unit | Purpose |
 |---|---|---|---|---|
-| `thermal_dwell_schedule_mode` | coEnum `ThermalDwellSchedule` | `PreferAnyTravel` | — | Alignment strategy. Live from Stage 3; Stages 1–2 behave as `ForcedOnly` regardless. |
+| `thermal_dwell_schedule_mode` | coEnum `ThermalDwellSchedule` | `PreferAnyTravel` | — | Where a flush lands: on the crossing move, or pulled early onto a layer change / travel within the look-ahead (live since Stage 3, see `STAGE3.md`). |
 | `thermal_dwell_lookahead` | coFloat | `15` | s | Max seconds a flush may be pulled early to hit a layer change / existing travel. |
 
 ### Enums
@@ -224,9 +224,11 @@ Build and verify each stage before starting the next.
   z-hop → travel to the machine flush position (X1C chute) → purge at purge flow → optional wiper
   drag → return → restore state → resume, then reset the accumulator. **See
   `docs/thermal_dwell_guard/STAGE2.md`, which governs this stage.** *Verify:* STAGE2 §10.
-- **Stage 3 — Smart scheduling.** Add look-ahead so flushes snap to the next layer change or
-  existing travel within `thermal_dwell_lookahead`; force a mid-print break only when no
-  natural break is available in time. *Verify:* flushes migrate to breaks when possible.
+- **Stage 3 — Smart scheduling.** Flushes are pulled early onto the latest layer change or
+  existing travel within `thermal_dwell_lookahead` (backward look-ahead at the crossing, then
+  an accumulator replay from the chosen break); a mid-extrusion anchor is forced only when no
+  natural break is close enough. **See `docs/thermal_dwell_guard/STAGE3.md`, which governs this
+  stage.** *Verify:* STAGE3 §9.
 - **Stage 4 — Calibration model.** Replace the constant `max_time` with a
   `(flow -> safe-seconds)` table + interpolation, and turn the Stage-0 Calibration-menu
   placeholder into a real calibration wizard.
@@ -247,4 +249,3 @@ semicolon — but the guard no longer reads them; they are a pure `wave_overhang
 - Per-machine flush templates for non-X1C printers — Stage 2 bakes the X1C chute XY + wiper as
   defaults; other printers get their own templates later.
 - Per-filament thermal options (flagged as a TODO, migrated in a later pass).
-- Scheduling/look-ahead (`schedule_mode`, `lookahead`) — schema-ready, live from Stage 3.

@@ -5260,9 +5260,11 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def = this->add("thermal_dwell_schedule_mode", coEnum);
     def->label = L("Flush scheduling");
     def->category = L("Strength");
-    def->tooltip = L("Alignment strategy for placing a flush: exactly at the limit, snapped to the "
-                     "next layer change, or to the next layer change or mid-layer travel. Live from "
-                     "the scheduling stage; earlier stages behave as forced-only regardless.");
+    def->tooltip = L("Where a flush is placed. Forced only: exactly on the move that reaches the "
+                     "limit, even mid-wall. Prefer layer change: pulled early onto the most recent "
+                     "layer change within the look-ahead window. Prefer any travel: pulled early "
+                     "onto the most recent layer change, or else the most recent travel move, "
+                     "within the window; falls back to forced when no break is close enough.");
     def->enum_keys_map = &ConfigOptionEnum<ThermalDwellSchedule>::get_enum_values();
     def->enum_values.push_back("forced_only");
     def->enum_values.push_back("prefer_layer_change");
@@ -5276,8 +5278,8 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def = this->add("thermal_dwell_lookahead", coFloat);
     def->label = L("Scheduling look-ahead");
     def->category = L("Strength");
-    def->tooltip = L("Maximum time a flush may be pulled early to hit a layer change or existing "
-                     "travel move.");
+    def->tooltip = L("Maximum time a flush may be pulled early to land on a layer change or an "
+                     "existing travel move. 0 disables scheduling (forced only).");
     def->sidetext = L("s");
     def->min = 0;
     def->mode = comAdvanced;
