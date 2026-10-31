@@ -73,9 +73,10 @@ For the flush move, reuse existing `travel_speed`, retraction (`retract_length`,
   hot filament out and pulls cooler filament in, relieving heat creep. So the accumulator
   should reset/decay after enough fast extrusion, not tick up forever. The forced flush is
   itself an engineered version of this exchange.
-- **Threshold vs flow:** safe dwell gets *shorter* as flow gets slower. v1 uses a single
-  constant limit; the correct model is a `(flow -> safe-seconds)` calibration table with
-  interpolation (Stage 4).
+- **Threshold vs flow:** safe dwell gets *shorter* as flow gets slower. The constant limit
+  `max_time` is the fallback; with `thermal_dwell_calibration_table` set, the guard accumulates
+  the *dwell fraction* `Δt / T(q)` against an interpolated `(flow -> safe-seconds)` table and
+  flushes at 1 (Stage 4, see `STAGE4.md`).
 - **Per-filament:** the thermal options (`max_time`, both flow thresholds,
   `melt_zone_volume`) are logically per-filament (ASA vs PETG vs PLA soak differently). v1
   keeps them global in print config for simplicity — see the TODO in §6.
@@ -110,6 +111,7 @@ stock OrcaSlicer.
 | `thermal_dwell_fast_flow_threshold` | coFloat | `5.0` | mm³/s | At/above this, extrusion counts as "fast" (drives reset). Must be ≥ `flow_threshold`. |
 | `thermal_dwell_reset_mode` | coEnum `ThermalDwellReset` | `OnFastSegment` | — | How the accumulator resets. |
 | `thermal_dwell_melt_zone_volume` | coFloat | `15` | mm³ | Effective molten volume in the hotend. Used by `OnVolume` reset and later calibration. |
+| `thermal_dwell_calibration_table` | coString | `""` | — | `flow:seconds` pairs (`;`-separated) from the calibration print; empty = constant `max_time` (Stage 4, `STAGE4.md`). |
 
 ### Group 3 — Flush action
 
@@ -229,9 +231,10 @@ Build and verify each stage before starting the next.
   an accumulator replay from the chosen break); a mid-extrusion anchor is forced only when no
   natural break is close enough. **See `docs/thermal_dwell_guard/STAGE3.md`, which governs this
   stage.** *Verify:* STAGE3 §9.
-- **Stage 4 — Calibration model.** Replace the constant `max_time` with a
-  `(flow -> safe-seconds)` table + interpolation, and turn the Stage-0 Calibration-menu
-  placeholder into a real calibration wizard.
+- **Stage 4 — Calibration model.** Part A (done): `thermal_dwell_calibration_table` with linear
+  interpolation and dwell-fraction accumulation; `max_time` stays as the fallback. Part B
+  (pending): the guided calibration wizard — the Calibration-menu entry currently describes the
+  manual procedure. **See `docs/thermal_dwell_guard/STAGE4.md`.**
 
 ## 9. Verification without printing
 

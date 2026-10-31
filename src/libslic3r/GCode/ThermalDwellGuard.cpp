@@ -31,6 +31,7 @@ std::optional<ThermalDwell::Config> ThermalDwellGuard::resolve_config(const Prin
         cfg.q_fast = float(rc.thermal_dwell_fast_flow_threshold.value);
         cfg.t_max  = float(rc.thermal_dwell_max_time.value);
         cfg.v_melt = float(rc.thermal_dwell_melt_zone_volume.value);
+        cfg.table  = ThermalDwell::parse_calibration_table(rc.thermal_dwell_calibration_table.value);
         return cfg;
     }
     return std::nullopt;
@@ -122,12 +123,13 @@ std::string ThermalDwellGuard::format_config_comment(const ThermalDwell::Config 
     char buf[512];
     snprintf(buf, sizeof(buf),
              ";THERMAL_DWELL_CONFIG flow_max=%g fast_min=%g max_time=%g reset=%s melt_zone=%g "
-             "flush_pos=%g,%g z_lift=%g purge_vol=%g purge_flow=%g wipe=%d sched=%s lookahead=%g\n",
+             "flush_pos=%g,%g z_lift=%g purge_vol=%g purge_flow=%g wipe=%d sched=%s lookahead=%g table=",
              cfg.q_slow, cfg.q_fast, cfg.t_max, reset, cfg.v_melt,
              flush.flush_pos.x(), flush.flush_pos.y(), flush.z_lift,
              flush.purge_volume, flush.purge_flow, int(flush.wipe),
              schedule_name(sched.mode), sched.lookahead);
-    return std::string(buf);
+    // STAGE4 §4: the parsed table, so the checker reproduces exactly what the guard used.
+    return std::string(buf) + ThermalDwell::format_calibration_table(cfg.table) + "\n";
 }
 
 void ThermalDwellGuard::on_move(bool is_extrusion, bool is_travel, float duration, float volume,
@@ -158,6 +160,7 @@ void ThermalDwellGuard::on_move(bool is_extrusion, bool is_travel, float duratio
         static_cast<ThermalDwell::AnchorState&>(a) = s.at;
         a.id    = s.id;
         a.acc   = s.acc;
+        a.frac  = s.frac;
         a.kind  = s.kind;
         a.early = s.early;
         // STAGE3 §6: the rewrite's merge-join needs anchors non-decreasing in g1_line_id. The
@@ -213,8 +216,8 @@ std::vector<std::string> ThermalDwellGuard::format_flush_lines(const FlushAnchor
 
     // Kept from Stage 1 (§7): the flush point, then the block markers around the sequence.
     // Stage 3 appends sched= / early= (STAGE3 §7); older parsers stop after z=.
-    snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_POINT id=%u acc=%.2fs layer=%u z=%.3f sched=%s early=%.2fs\n",
-             a.id, a.acc, a.layer, a.z, anchor_kind_name(a.kind), a.early);
+    snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_POINT id=%u acc=%.2fs layer=%u z=%.3f sched=%s early=%.2fs frac=%.3f\n",
+             a.id, a.acc, a.layer, a.z, anchor_kind_name(a.kind), a.early, a.frac);
     lines.emplace_back(buf);
     snprintf(buf, sizeof(buf), ";THERMAL_DWELL_FLUSH_START id=%u\n", a.id);
     lines.emplace_back(buf);
@@ -299,8 +302,8 @@ std::string ThermalDwellGuard::format_summary() const
              count, total_purge, est_added, scheduled);
     out += buf;
     for (const FlushAnchor &a : m_anchors) {
-        snprintf(buf, sizeof(buf), ";THERMAL_DWELL_POINT id=%u layer=%u z=%.3f acc=%.2f sched=%s early=%.2f\n",
-                 a.id, a.layer, a.z, a.acc, anchor_kind_name(a.kind), a.early);
+        snprintf(buf, sizeof(buf), ";THERMAL_DWELL_POINT id=%u layer=%u z=%.3f acc=%.2f sched=%s early=%.2f frac=%.3f\n",
+                 a.id, a.layer, a.z, a.acc, anchor_kind_name(a.kind), a.early, a.frac);
         out += buf;
     }
     return out;

@@ -66,6 +66,7 @@ public:
     {
         unsigned int            id{ 0 };     // 1..N
         float                   acc{ 0.0f }; // s, accumulator value at the anchor
+        float                   frac{ 0.0f }; // dwell fraction at the anchor (STAGE4 §4)
         ThermalDwell::AnchorKind kind{ ThermalDwell::AnchorKind::Forced }; // STAGE3 §7 sched=
         float                   early{ 0.0f }; // s pulled before the crossing (0 when forced)
     };

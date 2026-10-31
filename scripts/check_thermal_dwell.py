@@ -26,7 +26,11 @@ Stage 3 (scheduled flushes). Checks performed:
   7. anchor placement: a scheduled flush sits directly after a non-extruding XY travel, and a
      layer_change one before any extrusion of its layer
 
-Stage-2 files (no sched= fields) are still accepted: every point is then treated as forced.
+Stage 4: with a calibration table (CONFIG table=) the limit is the dwell fraction frac=1 (STAGE4
+§2/§5); without one the max_time checks above apply.
+
+Stage-2/3 files (no sched= / frac= fields) are still accepted: missing fields default to forced /
+no table.
 
 Usage:
     python3 check_thermal_dwell.py <file.gcode> [--baseline off.gcode] [--tolerance 0.25] [-v]
@@ -44,11 +48,11 @@ PURGE_TOLERANCE = 0.01  # ±1% on the purge volume (STAGE2 §9a)
 RE_CONFIG = re.compile(
     r"^;THERMAL_DWELL_CONFIG flow_max=(\S+) fast_min=(\S+) max_time=(\S+) reset=(\S+) "
     r"melt_zone=(\S+) flush_pos=(\S+) z_lift=(\S+) purge_vol=(\S+) purge_flow=(\S+) wipe=(\d+)"
-    r"(?: sched=(\S+) lookahead=(\S+))?"
+    r"(?: sched=(\S+) lookahead=(\S+))?(?: table=(\S+))?"
 )
 RE_FLUSH_POINT = re.compile(
     r"^;THERMAL_DWELL_FLUSH_POINT id=(\d+) acc=([\d.]+)s layer=(\d+) z=([\d.-]+)"
-    r"(?: sched=(\w+) early=([\d.]+)s)?"
+    r"(?: sched=(\w+) early=([\d.]+)s)?(?: frac=([\d.]+))?"
 )
 RE_FLUSH_START = re.compile(r"^;THERMAL_DWELL_FLUSH_START id=(\d+)")
 RE_FLUSH_END = re.compile(r"^;THERMAL_DWELL_FLUSH_END id=(\d+)")
@@ -58,7 +62,7 @@ RE_SUMMARY = re.compile(
 )
 RE_POINT = re.compile(
     r"^;THERMAL_DWELL_POINT id=(\d+) layer=(\d+) z=([\d.-]+) acc=([\d.]+)"
-    r"(?: sched=(\w+) early=([\d.]+))?"
+    r"(?: sched=(\w+) early=([\d.]+))?(?: frac=([\d.]+))?"
 )
 
 # Filament diameter is needed to turn dE into mm^3 and is NOT part of the CONFIG echo; it comes
@@ -118,15 +122,29 @@ class NaiveAccumulator:
     def __init__(self, cfg):
         self.cfg = cfg
         self.acc = 0.0
+        self.frac = 0.0
         self.fast_vol = 0.0
         self.count = 0
+        self.table = cfg.get("table") or []
+        self.acc_before = 0.0   # acc / frac before the move currently being stepped: a crossing
+        self.frac_before = 0.0  # may legitimately overshoot by that one move (STAGE1 §1, no splitting)
+
+    def safe_time(self, q):
+        return safe_seconds(self.table, q) if self.table else self.cfg["t_max"]
+
+    def static_safe_time(self):
+        return self.table[0][1] if self.table else self.cfg["t_max"]
 
     def step(self, is_extrusion, duration, volume):
+        self.acc_before, self.frac_before = self.acc, self.frac
         if is_extrusion:
             q = volume / duration if duration > 0.0 else math.inf
             if q <= self.cfg["q_slow"]:
                 self.fast_vol = 0.0
                 self.acc += duration
+                t = self.safe_time(q)
+                if t > 0.0:
+                    self.frac += duration / t
                 return self._check()
             if q < self.cfg["q_fast"]:
                 return None
@@ -144,18 +162,29 @@ class NaiveAccumulator:
             return None
         if self.acc > 0.0:
             self.acc += duration
+            t = self.static_safe_time()
+            if t > 0.0:
+                self.frac += duration / t
             return self._check()
         return None
 
     def _reset_episode(self):
         self.acc = 0.0
+        self.frac = 0.0
         self.fast_vol = 0.0
 
     def _check(self):
-        if self.cfg["t_max"] <= 0.0 or self.acc < self.cfg["t_max"]:
+        if self.table:
+            if self.frac < 1.0:
+                return None
+        elif self.cfg["t_max"] <= 0.0 or self.acc < self.cfg["t_max"]:
             return None
         self.count += 1
-        event = {"id": self.count, "acc": self.acc}
+        frac = self.frac if self.table else (self.acc / self.cfg["t_max"] if self.cfg["t_max"] > 0 else 0.0)
+        event = {"id": self.count, "acc": self.acc, "frac": frac,
+                 "acc_before": self.acc_before,
+                 "frac_before": (self.frac_before if self.table else
+                                 (self.acc_before / self.cfg["t_max"] if self.cfg["t_max"] > 0 else 0.0))}
         self._reset_episode()
         return event
 
@@ -198,33 +227,34 @@ class NaiveScheduler:
             if self.acc.acc <= 0.0:
                 self.buf = []
                 return
-            self.buf.append((is_extrusion, duration, volume, kind, self.t, self.acc.acc, index))
+            self.buf.append((is_extrusion, duration, volume, kind, self.t, self.acc.acc, index, self.acc.frac))
             while self.buf and self.t - self.buf[0][4] > self.lookahead:
                 self.buf.pop(0)
             return
 
         chosen = self._choose()
         if chosen is None:
-            self._emit(ev["acc"], "forced", 0.0, index)
+            self._emit(ev["acc"], "forced", 0.0, index, ev["frac"], ev["frac_before"])
             self.buf = []
             return
         b = self.buf[chosen]
-        self._emit(b[5], b[3], self.t - b[4], b[6])
-        tail = self.buf[chosen + 1:] + [(is_extrusion, duration, volume, kind, self.t, 0.0, index)]
+        self._emit(b[5], b[3], self.t - b[4], b[6], b[7])
+        tail = self.buf[chosen + 1:] + [(is_extrusion, duration, volume, kind, self.t, 0.0, index, 0.0)]
         sim = NaiveAccumulator(self.cfg)
         kept = []
         for rec in tail:
             ev2 = sim.step(rec[0], rec[1], rec[2])
             if ev2:
-                self._emit(ev2["acc"], "forced", 0.0, rec[6])
+                self._emit(ev2["acc"], "forced", 0.0, rec[6], ev2["frac"], ev2["frac_before"])
                 kept = []
                 continue
             if sim.acc <= 0.0:
                 kept = []
                 continue
-            kept.append(rec[:5] + (sim.acc, rec[6]))
+            kept.append(rec[:5] + (sim.acc, rec[6], sim.frac))
         self.buf = kept
         self.acc.acc = sim.acc
+        self.acc.frac = sim.frac
         self.acc.fast_vol = sim.fast_vol
 
     def _choose(self):
@@ -241,9 +271,10 @@ class NaiveScheduler:
                 best_travel = i
         return best_travel
 
-    def _emit(self, acc, kind, early, index):
+    def _emit(self, acc, kind, early, index, frac, frac_before=0.0):
         self.count += 1
-        self.events.append({"id": self.count, "acc": acc, "sched": kind, "early": early, "index": index})
+        self.events.append({"id": self.count, "acc": acc, "sched": kind, "early": early, "index": index, "frac": frac,
+                            "frac_before": frac_before})
 
 
 def parse_config(lines):
@@ -265,8 +296,40 @@ def parse_config(lines):
                 # Stage 3; a Stage-2 file has neither, which means ForcedOnly.
                 "sched": m.group(11) or "forced_only",
                 "lookahead": float(m.group(12)) if m.group(12) else 0.0,
+                # Stage 4: "q:t;q:t" or "none"/absent.
+                "table": parse_table(m.group(13)),
             }
     return None
+
+
+def parse_table(text):
+    """STAGE4 §3: "q:t;q:t" -> sorted [(q, t)], or [] for none/absent."""
+    table = {}
+    if not text or text == "none":
+        return []
+    for item in text.split(";"):
+        if ":" not in item:
+            continue
+        q, t = item.split(":", 1)
+        try:
+            q, t = float(q), float(t)
+        except ValueError:
+            continue
+        if q > 0.0 and t > 0.0:
+            table[q] = t
+    return sorted(table.items())
+
+
+def safe_seconds(table, q):
+    """Linear interpolation in q, clamped at both ends (STAGE4 §2)."""
+    if q <= table[0][0]:
+        return table[0][1]
+    if q >= table[-1][0]:
+        return table[-1][1]
+    for (q0, t0), (q1, t1) in zip(table, table[1:]):
+        if q0 <= q <= q1:
+            return t0 + (q - q0) / (q1 - q0) * (t1 - t0)
+    return table[-1][1]
 
 
 def filament_diameter(lines):
@@ -651,7 +714,7 @@ def main():
         f"config: reset={cfg['reset']} q_slow={cfg['q_slow']} q_fast={cfg['q_fast']} "
         f"t_max={cfg['t_max']} v_melt={cfg['v_melt']} flush_pos={cfg['flush_pos']} "
         f"purge_vol={cfg['purge_vol']} purge_flow={cfg['purge_flow']} wipe={cfg['wipe']} "
-        f"sched={cfg['sched']} lookahead={cfg['lookahead']}"
+        f"sched={cfg['sched']} lookahead={cfg['lookahead']} table={cfg['table'] or 'none'}"
     )
 
     diameter = filament_diameter(lines)
@@ -666,6 +729,7 @@ def main():
             "id": int(m.group(1)), "acc": float(m.group(2)), "layer": int(m.group(3)),
             "z": float(m.group(4)), "sched": m.group(5) or "forced",
             "early": float(m.group(6)) if m.group(6) else 0.0,
+            "frac": float(m.group(7)) if m.group(7) else None,
         }
         for m in (RE_FLUSH_POINT.match(l) for l in lines) if m
     ]
@@ -674,6 +738,7 @@ def main():
             "id": int(m.group(1)), "layer": int(m.group(2)), "z": float(m.group(3)),
             "acc": float(m.group(4)), "sched": m.group(5) or "forced",
             "early": float(m.group(6)) if m.group(6) else 0.0,
+            "frac": float(m.group(7)) if m.group(7) else None,
         }
         for m in (RE_POINT.match(l) for l in lines) if m
     ]
@@ -698,24 +763,48 @@ def main():
     n_scheduled = sum(1 for p in inline if p["sched"] != "forced")
 
     # --- Check 1: acc consistent with the sched kind, and the naive model roughly agrees ----
-    t_max, look = cfg["t_max"], cfg["lookahead"]
+    t_max, look, table = cfg["t_max"], cfg["lookahead"], cfg["table"]
+    t_static = table[0][1] if table else t_max
+    paired = dict(zip((p["id"] for p in inline), naive_events)) if len(naive_events) == len(inline) else {}
+
+    def within_one_move(pid):
+        """STAGE1 §1: no move splitting, so a flush may overshoot by the crossing move's own duration.
+        Accept the overshoot when the naive model agrees the limit was not yet reached before that move."""
+        ev = paired.get(pid)
+        return ev is not None and ev.get("frac_before", 1.0) < 1.0
+
     for point in inline:
         pid, acc, kind, early = point["id"], point["acc"], point["sched"], point["early"]
+        frac = point["frac"]
         if kind not in SCHED_KINDS:
             failures.append(f"id={pid}: unknown sched kind '{kind}'")
             continue
-        if acc > t_max * (1.0 + args.tolerance):
-            failures.append(f"id={pid}: acc {acc}s overshoots max_time {t_max}s by more than {args.tolerance:.0%}")
-        if kind == "forced":
-            if acc < t_max:
+        if table and frac is None:
+            failures.append(f"id={pid}: CONFIG has a calibration table but the marker carries no frac=")
+            continue
+        if table:
+            # STAGE4 §5: the dwell fraction is the limit.
+            if frac > 1.0 + args.tolerance and not within_one_move(pid):
+                failures.append(f"id={pid}: frac {frac} overshoots 1 by more than {args.tolerance:.0%} (and not within one move)")
+            if kind == "forced" and frac < 1.0 - 1e-3:
+                failures.append(f"id={pid}: forced flush with frac {frac} < 1")
+            if kind != "forced" and frac < 1.0 - look / t_static - 1e-3:
+                failures.append(f"id={pid}: scheduled flush frac {frac} < 1 - lookahead/T_static ({1.0 - look / t_static:.3f})")
+        else:
+            if acc > t_max * (1.0 + args.tolerance) and not within_one_move(pid):
+                failures.append(f"id={pid}: acc {acc}s overshoots max_time {t_max}s by more than {args.tolerance:.0%} (and not within one move)")
+            if kind == "forced" and acc < t_max:
                 failures.append(f"id={pid}: forced flush with acc {acc}s < max_time {t_max}s")
+            if kind != "forced" and acc < t_max - look - 1e-3:
+                failures.append(f"id={pid}: scheduled flush acc {acc}s < max_time - lookahead ({t_max - look:.2f}s)")
+            if frac is not None and t_max > 0 and abs(frac - acc / t_max) > 0.01:
+                failures.append(f"id={pid}: frac {frac} != acc/max_time {acc / t_max:.3f} (no table)")
+        if kind == "forced":
             if early > 1e-6:
                 failures.append(f"id={pid}: forced flush reports early={early}s (must be 0)")
         else:
             if cfg["sched"] == "forced_only":
                 failures.append(f"id={pid}: sched={kind} although the CONFIG says forced_only")
-            if acc < t_max - look - 1e-3:
-                failures.append(f"id={pid}: scheduled flush acc {acc}s < max_time - lookahead ({t_max - look:.2f}s)")
             if early < 0.0 or early > look + 1e-3:
                 failures.append(f"id={pid}: early={early}s outside [0, lookahead={look}s]")
             if cfg["sched"] == "prefer_layer_change" and kind != "layer_change":
@@ -786,6 +875,8 @@ def main():
             for a, b in zip(inline, summary_points)
             if a["layer"] != b["layer"] or abs(a["z"] - b["z"]) > 1e-3 or abs(a["acc"] - b["acc"]) > 1e-2
             or a["sched"] != b["sched"] or abs(a["early"] - b["early"]) > 1e-2
+            or ((a["frac"] is None) != (b["frac"] is None))
+            or (a["frac"] is not None and abs(a["frac"] - b["frac"]) > 1e-2)
         ]
         if disagreements:
             failures.extend(disagreements)

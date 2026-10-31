@@ -5196,6 +5196,18 @@ def = this->add("wave_overhang_spacing_mode", coEnum);
     def->set_default_value(new ConfigOptionEnum<ThermalDwellReset>(ThermalDwellReset::OnFastSegment));
 
     // TODO: candidate for per-filament coFloats
+    def = this->add("thermal_dwell_calibration_table", coString);
+    def->label = L("Calibration table");
+    def->category = L("Strength");
+    def->tooltip = L("Safe dwell time as a function of volumetric flow, from the thermal dwell "
+                     "calibration print: 'flow:seconds' pairs separated by ';', for example "
+                     "'0.5:45;1:70;2:120'. Between entries the safe time is interpolated; beyond "
+                     "the ends it is clamped. The guard then accumulates the fraction of the safe "
+                     "time used at each flow and flushes when the fractions add up to 1. Leave "
+                     "empty to use the constant safe accumulated time instead.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString(""));
+
     def = this->add("thermal_dwell_melt_zone_volume", coFloat);
     def->label = L("Melt-zone volume");
     def->category = L("Strength");

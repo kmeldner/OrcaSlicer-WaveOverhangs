@@ -1035,6 +1035,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         std::string("thermal_dwell_fast_flow_threshold"),
         std::string("thermal_dwell_reset_mode"),
         std::string("thermal_dwell_melt_zone_volume"),
+        std::string("thermal_dwell_calibration_table"),
         std::string("thermal_dwell_flush_z_lift"),
         std::string("thermal_dwell_flush_position"),
         std::string("thermal_dwell_purge_volume"),

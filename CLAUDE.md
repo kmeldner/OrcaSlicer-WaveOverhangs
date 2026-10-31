@@ -121,7 +121,8 @@ ctest --test-dir ./tests/sla_print/sla_print_tests
   "slow-flow seconds" from each move's volumetric flow across the whole print and pre-injects
   filament flushes at the printer's designated flush position (Bambu X1C poop-chute) to prevent
   heat-creep jams, pulling each flush early onto the nearest layer change or travel when one is
-  within the look-ahead window. It depends on no wave-overhang code and is portable to stock OrcaSlicer. See
+  within the look-ahead window, and accumulating against a per-flow calibration table when one is set.
+  It depends on no wave-overhang code and is portable to stock OrcaSlicer. See
   `docs/thermal_dwell_guard/` (SPEC + staged specs); verify with `scripts/check_thermal_dwell.py`.
 
 ### File Format Support

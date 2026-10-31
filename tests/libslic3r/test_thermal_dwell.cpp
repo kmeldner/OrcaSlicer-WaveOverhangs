@@ -599,3 +599,119 @@ TEST_CASE("Thermal dwell guard: scheduled anchors carry sched/early in the marke
     REQUIRE_THAT(lines.front(), ContainsSubstring("sched=travel early=4.00s"));
     REQUIRE_THAT(guard.format_summary(), ContainsSubstring("scheduled=1"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stage 4 calibration table / dwell fraction (STAGE4 §2–§3).
+
+namespace {
+
+using Slic3r::ThermalDwell::CalibrationTable;
+using Slic3r::ThermalDwell::parse_calibration_table;
+using Slic3r::ThermalDwell::format_calibration_table;
+using Slic3r::ThermalDwell::safe_seconds;
+
+// q = volume / duration; a 1 s move of `q` mm^3.
+Move flow_move(float q, float duration = 1.0f)
+{
+    Move m;
+    m.is_extrusion = true;
+    m.duration = duration;
+    m.volume = q * duration;
+    return m;
+}
+
+} // namespace
+
+TEST_CASE("Thermal dwell table: parser is tolerant and sorts by flow", "[ThermalDwell]")
+{
+    const CalibrationTable t = parse_calibration_table(" 2 : 120 ; 0.5:45;1:70; junk ; -1:5 ; 1:80 ");
+    REQUIRE(t.size() == 3);
+    REQUIRE_THAT(t[0].first, WithinAbs(0.5f, 1e-6f));
+    REQUIRE_THAT(t[0].second, WithinAbs(45.0f, 1e-6f));
+    REQUIRE_THAT(t[1].first, WithinAbs(1.0f, 1e-6f));
+    REQUIRE_THAT(t[1].second, WithinAbs(80.0f, 1e-6f)); // duplicate: last wins
+    REQUIRE_THAT(t[2].first, WithinAbs(2.0f, 1e-6f));
+    REQUIRE(format_calibration_table(t) == "0.5:45;1:80;2:120");
+    REQUIRE(parse_calibration_table("").empty());
+    REQUIRE(format_calibration_table({}) == "none");
+}
+
+TEST_CASE("Thermal dwell table: interpolation inside, clamped at both ends", "[ThermalDwell]")
+{
+    const CalibrationTable t = parse_calibration_table("0.5:40;1:70;2:120");
+    REQUIRE_THAT(safe_seconds(t, 0.1f), WithinAbs(40.0f, 1e-5f));  // below -> first
+    REQUIRE_THAT(safe_seconds(t, 0.5f), WithinAbs(40.0f, 1e-5f));
+    REQUIRE_THAT(safe_seconds(t, 0.75f), WithinAbs(55.0f, 1e-5f)); // midway 40..70
+    REQUIRE_THAT(safe_seconds(t, 1.5f), WithinAbs(95.0f, 1e-5f));  // midway 70..120
+    REQUIRE_THAT(safe_seconds(t, 2.0f), WithinAbs(120.0f, 1e-5f));
+    REQUIRE_THAT(safe_seconds(t, 9.0f), WithinAbs(120.0f, 1e-5f)); // above -> last
+    const CalibrationTable one = parse_calibration_table("1:50");
+    REQUIRE_THAT(safe_seconds(one, 0.2f), WithinAbs(50.0f, 1e-5f));
+    REQUIRE_THAT(safe_seconds(one, 5.0f), WithinAbs(50.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell table: an empty table is the constant model", "[ThermalDwell]")
+{
+    Accumulator acc(make_config()); // t_max 10, no table
+    for (int i = 0; i < 9; ++i) {
+        REQUIRE_FALSE(acc.step(slow_move()).has_value());
+        REQUIRE_THAT(acc.frac(), WithinAbs(float(i + 1) / 10.0f, 1e-5f));
+    }
+    const auto ev = acc.step(slow_move());
+    REQUIRE(ev.has_value());
+    REQUIRE_THAT(ev->acc, WithinAbs(10.0f, 1e-5f));
+    REQUIRE_THAT(ev->frac, WithinAbs(1.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell table: fractions at different flows add up (Miner's rule)", "[ThermalDwell]")
+{
+    Config cfg = make_config();
+    cfg.t_max = 1000.0f; // irrelevant once a table is set
+    cfg.table = parse_calibration_table("0.5:4;1:8"); // T(0.5)=4 s, T(1)=8 s
+    Accumulator acc(cfg);
+
+    // 2 s at q=1 -> frac 0.25; 2 s at q=0.5 -> +0.5 = 0.75; 1 s at q=0.5 -> 1.0 -> flush.
+    REQUIRE_FALSE(acc.step(flow_move(1.0f, 2.0f)).has_value());
+    REQUIRE_THAT(acc.frac(), WithinAbs(0.25f, 1e-5f));
+    REQUIRE_FALSE(acc.step(flow_move(0.5f, 2.0f)).has_value());
+    REQUIRE_THAT(acc.frac(), WithinAbs(0.75f, 1e-5f));
+    const auto ev = acc.step(flow_move(0.5f, 1.0f));
+    REQUIRE(ev.has_value());
+    REQUIRE_THAT(ev->frac, WithinAbs(1.0f, 1e-5f));
+    REQUIRE_THAT(ev->acc, WithinAbs(5.0f, 1e-5f)); // seconds are still reported
+    REQUIRE_THAT(acc.frac(), WithinAbs(0.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell table: slower flow reaches the limit sooner", "[ThermalDwell]")
+{
+    Config cfg = make_config();
+    cfg.table = parse_calibration_table("0.5:4;1:8");
+    Accumulator fast(cfg), slow(cfg);
+    int n_fast = 0, n_slow = 0;
+    while (! fast.step(flow_move(1.0f)).has_value()) ++n_fast;
+    while (! slow.step(flow_move(0.5f)).has_value()) ++n_slow;
+    REQUIRE(n_fast == 7); // 8th second crosses
+    REQUIRE(n_slow == 3); // 4th second crosses
+}
+
+TEST_CASE("Thermal dwell table: static time inside an episode soaks at the slowest tabulated rate", "[ThermalDwell]")
+{
+    Config cfg = make_config();
+    cfg.table = parse_calibration_table("0.5:4;1:8");
+    Accumulator acc(cfg);
+    acc.step(flow_move(1.0f, 2.0f));       // frac 0.25
+    acc.step(travel_move(1.0f));           // +1/4 = 0.5 (T_static = 4 s)
+    REQUIRE_THAT(acc.frac(), WithinAbs(0.5f, 1e-5f));
+    REQUIRE_THAT(acc.acc(), WithinAbs(3.0f, 1e-5f));
+}
+
+TEST_CASE("Thermal dwell table: a reset zeroes the fraction too", "[ThermalDwell]")
+{
+    Config cfg = make_config();
+    cfg.table = parse_calibration_table("0.5:4;1:8");
+    Accumulator acc(cfg);
+    acc.step(flow_move(1.0f, 4.0f));       // frac 0.5
+    acc.step(fast_move(6.0f));             // row 4 reset
+    REQUIRE_THAT(acc.frac(), WithinAbs(0.0f, 1e-5f));
+    REQUIRE_THAT(acc.acc(), WithinAbs(0.0f, 1e-5f));
+}

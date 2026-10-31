@@ -65,6 +65,7 @@ struct Scheduled
     AnchorState  at;                      // where the flush is anchored
     unsigned int id{ 0 };                 // 1..N, assigned by the scheduler
     float        acc{ 0.0f };             // accumulator value at the anchor [s]
+    float        frac{ 0.0f };            // dwell fraction at the anchor (STAGE4 §2)
     AnchorKind   kind{ AnchorKind::Forced };
     float        early{ 0.0f };           // seconds the flush was pulled before the crossing
 };
@@ -97,6 +98,7 @@ private:
         AnchorKind  brk{ AnchorKind::Forced }; // Forced == "not a break"
         float       t_end{ 0.0f };            // print time at the end of the move
         float       acc_after{ 0.0f };        // accumulator value right after the move
+        float       frac_after{ 0.0f };       // dwell fraction right after the move
     };
 
     AnchorKind classify_break(const Move &move, bool is_travel, const AnchorState &state);
@@ -105,7 +107,7 @@ private:
     // STAGE3 §5: re-run the moves after `from` (exclusive) through a fresh accumulator state,
     // emitting forced anchors for any re-crossing, and install the result as the live state.
     void replay_after(size_t from_index, std::vector<Scheduled> &out);
-    Scheduled make(const AnchorState &st, float acc, AnchorKind kind, float early);
+    Scheduled make(const AnchorState &st, float acc, float frac, AnchorKind kind, float early);
 
     Accumulator     m_acc;
     ScheduleConfig  m_sched;

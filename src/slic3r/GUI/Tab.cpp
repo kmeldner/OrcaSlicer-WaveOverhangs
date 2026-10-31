@@ -2504,6 +2504,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("thermal_dwell_fast_flow_threshold");
         optgroup->append_single_option_line("thermal_dwell_reset_mode");
         optgroup->append_single_option_line("thermal_dwell_melt_zone_volume");
+        optgroup->append_single_option_line("thermal_dwell_calibration_table");
 
         optgroup = page->new_optgroup(L("Flush action"), L"param_overhang");
         optgroup->append_single_option_line("thermal_dwell_flush_z_lift");

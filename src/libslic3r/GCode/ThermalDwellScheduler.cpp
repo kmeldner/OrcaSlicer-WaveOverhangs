@@ -3,12 +3,13 @@
 namespace Slic3r {
 namespace ThermalDwell {
 
-Scheduled Scheduler::make(const AnchorState &st, float acc, AnchorKind kind, float early)
+Scheduled Scheduler::make(const AnchorState &st, float acc, float frac, AnchorKind kind, float early)
 {
     Scheduled s;
     s.at    = st;
     s.id    = ++m_count;
     s.acc   = acc;
+    s.frac  = frac;
     s.kind  = kind;
     s.early = early;
     m_have_anchor    = true;
@@ -88,7 +89,7 @@ void Scheduler::replay_after(size_t from_index, std::vector<Scheduled> &out)
         if (const std::optional<FlushEvent> ev = sim.step(rec.move)) {
             // A re-crossing inside the window (only possible when lookahead >= t_max). Anchor
             // it forced on the move it fired on; the sim is already zeroed by the event.
-            out.push_back(make(rec.st, ev->acc, AnchorKind::Forced, 0.0f));
+            out.push_back(make(rec.st, ev->acc, ev->frac, AnchorKind::Forced, 0.0f));
             kept.clear();
             continue;
         }
@@ -96,11 +97,12 @@ void Scheduler::replay_after(size_t from_index, std::vector<Scheduled> &out)
             kept.clear(); // left the episode
             continue;
         }
-        rec.acc_after = sim.acc();
+        rec.acc_after  = sim.acc();
+        rec.frac_after = sim.frac();
         kept.push_back(rec);
     }
     m_buf = std::move(kept);
-    m_acc.set_episode(sim.acc(), sim.fast_vol());
+    m_acc.set_episode(sim.acc(), sim.frac(), sim.fast_vol());
 }
 
 std::vector<Scheduled> Scheduler::step(const Move &move, bool is_travel, const AnchorState &state)
@@ -123,7 +125,8 @@ std::vector<Scheduled> Scheduler::step(const Move &move, bool is_travel, const A
         rec.st        = state;
         rec.brk       = brk;
         rec.t_end     = m_t;
-        rec.acc_after = m_acc.acc();
+        rec.acc_after  = m_acc.acc();
+        rec.frac_after = m_acc.frac();
         m_buf.push_back(rec);
         // Trim moves that have fallen out of the window (STAGE3 §6).
         while (! m_buf.empty() && m_t - m_buf.front().t_end > m_sched.lookahead)
@@ -135,13 +138,13 @@ std::vector<Scheduled> Scheduler::step(const Move &move, bool is_travel, const A
     const int index = choose_break(m_t);
     if (index < 0) {
         // Forced (Stage 2 semantics): anchor here, new episode starts empty.
-        out.push_back(make(state, ev->acc, AnchorKind::Forced, 0.0f));
+        out.push_back(make(state, ev->acc, ev->frac, AnchorKind::Forced, 0.0f));
         m_buf.clear();
         return out;
     }
 
     const Rec b = m_buf[size_t(index)];
-    out.push_back(make(b.st, b.acc_after, b.brk, m_t - b.t_end));
+    out.push_back(make(b.st, b.acc_after, b.frac_after, b.brk, m_t - b.t_end));
 
     // The crossing move itself is part of the replayed tail: append it, then replay after B.
     Rec cur;

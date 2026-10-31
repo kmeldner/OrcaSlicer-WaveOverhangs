@@ -3320,12 +3320,21 @@ void MainFrame::init_menubar_as_editor()
         }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
-    // Thermal dwell guard (placeholder — the calibration wizard lands in a later stage)
+    // Thermal dwell guard calibration: manual procedure dialog (STAGE4 §6; guided wizard pending)
     append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Thermal dwell guard"), _L("Thermal dwell guard calibration"),
         [this](wxCommandEvent&) {
             MessageDialog dlg(this,
-                _L("Thermal dwell guard calibration is not implemented yet — coming in a later update."),
-                _L("Thermal dwell guard"), wxOK | wxICON_INFORMATION);
+                _L("Calibrating the thermal dwell guard (manual procedure; the guided wizard is not available yet):\n\n"
+                   "1. Print a single-wall hollow cylinder (about 25 mm diameter, 100 mm tall, one perimeter, no infill, "
+                   "no top or bottom) with the thermal dwell guard and wave overhangs disabled.\n"
+                   "2. Set the outer wall speed so the volumetric flow is constant and slow: flow = wall speed x line width "
+                   "x layer height. With 0.42 mm lines and 0.2 mm layers, 6 / 12 / 24 mm/s give 0.5 / 1.0 / 2.0 mm3/s.\n"
+                   "3. Note the time (or the layer, times the seconds per layer) at which extrusion thins, grinds or stops. "
+                   "Take 80% of it as the safe time for that flow. A cylinder that finishes gives a lower bound.\n"
+                   "4. Repeat for two or three flows spanning your slow range, then enter the pairs in Process settings > "
+                   "Thermal dwell guard > Calibration table as 'flow:seconds' separated by ';', e.g. 0.5:45;1:70;2:120.\n\n"
+                   "See docs/thermal_dwell_guard/STAGE4.md for the full procedure."),
+                _L("Thermal dwell guard calibration"), wxOK | wxICON_INFORMATION);
             dlg.ShowModal();
         }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown(); }, this);
@@ -3441,12 +3450,21 @@ void MainFrame::init_menubar_as_editor()
         }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
-    // Thermal dwell guard (placeholder — the calibration wizard lands in a later stage)
+    // Thermal dwell guard calibration: manual procedure dialog (STAGE4 §6; guided wizard pending)
     append_menu_item(calib_menu, wxID_ANY, _L("Thermal dwell guard"), _L("Thermal dwell guard calibration"),
         [this](wxCommandEvent&) {
             MessageDialog dlg(this,
-                _L("Thermal dwell guard calibration is not implemented yet — coming in a later update."),
-                _L("Thermal dwell guard"), wxOK | wxICON_INFORMATION);
+                _L("Calibrating the thermal dwell guard (manual procedure; the guided wizard is not available yet):\n\n"
+                   "1. Print a single-wall hollow cylinder (about 25 mm diameter, 100 mm tall, one perimeter, no infill, "
+                   "no top or bottom) with the thermal dwell guard and wave overhangs disabled.\n"
+                   "2. Set the outer wall speed so the volumetric flow is constant and slow: flow = wall speed x line width "
+                   "x layer height. With 0.42 mm lines and 0.2 mm layers, 6 / 12 / 24 mm/s give 0.5 / 1.0 / 2.0 mm3/s.\n"
+                   "3. Note the time (or the layer, times the seconds per layer) at which extrusion thins, grinds or stops. "
+                   "Take 80% of it as the safe time for that flow. A cylinder that finishes gives a lower bound.\n"
+                   "4. Repeat for two or three flows spanning your slow range, then enter the pairs in Process settings > "
+                   "Thermal dwell guard > Calibration table as 'flow:seconds' separated by ';', e.g. 0.5:45;1:70;2:120.\n\n"
+                   "See docs/thermal_dwell_guard/STAGE4.md for the full procedure."),
+                _L("Thermal dwell guard calibration"), wxOK | wxICON_INFORMATION);
             dlg.ShowModal();
         }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown(); }, this);

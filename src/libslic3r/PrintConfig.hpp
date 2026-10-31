@@ -1198,6 +1198,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                       thermal_dwell_fast_flow_threshold))
     ((ConfigOptionEnum<ThermalDwellReset>,     thermal_dwell_reset_mode))
     ((ConfigOptionFloat,                       thermal_dwell_melt_zone_volume))
+    ((ConfigOptionString,                      thermal_dwell_calibration_table))
     ((ConfigOptionFloat,                       thermal_dwell_flush_z_lift))
     ((ConfigOptionPoint,                       thermal_dwell_flush_position))
     ((ConfigOptionFloat,                       thermal_dwell_purge_volume))

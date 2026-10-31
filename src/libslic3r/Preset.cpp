@@ -898,7 +898,7 @@ static std::vector<std::string> s_Preset_print_options {
     // are absent from the Print preset and the settings tab crashes when rendering them.
     "thermal_dwell_guard_enable",
     "thermal_dwell_flow_threshold", "thermal_dwell_max_time", "thermal_dwell_fast_flow_threshold",
-    "thermal_dwell_reset_mode", "thermal_dwell_melt_zone_volume",
+    "thermal_dwell_reset_mode", "thermal_dwell_melt_zone_volume", "thermal_dwell_calibration_table",
     "thermal_dwell_flush_z_lift", "thermal_dwell_flush_position",
     "thermal_dwell_purge_volume", "thermal_dwell_purge_flow",
     "thermal_dwell_wipe",
